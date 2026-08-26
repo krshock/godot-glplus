@@ -238,7 +238,7 @@ void main() {
 	normal.y = cos(theta);
 	normal.z = cos(phi) * sin(theta) * -1.0;
 
-	vec3 color = srgb_to_linear(textureLod(source_cube, normal, mip_level).rgb);
+	vec3 color = textureLod(source_cube, normal, mip_level).rgb;
 	frag_color = vec4(color, 1.0);
 
 #endif

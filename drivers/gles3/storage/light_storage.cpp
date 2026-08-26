@@ -38,6 +38,7 @@
 #include "drivers/gles3/effects/cubemap_filter.h"
 #include "drivers/gles3/rasterizer_scene_gles3.h"
 #include "drivers/gles3/rasterizer_util_gles3.h"
+#include "drivers/gles3/storage/config.h"
 #include "drivers/gles3/storage/render_scene_buffers_gles3.h"
 #include "drivers/gles3/storage/utilities.h"
 
@@ -887,6 +888,13 @@ bool LightStorage::reflection_probe_instance_begin_render(RID p_instance, RID p_
 		atlas->mipmap_count = Image::get_image_required_mipmaps(atlas->size, atlas->size, Image::FORMAT_RGBAH) - 1;
 		atlas->mipmap_count = MIN(atlas->mipmap_count, 8); // No more than 8 please..
 
+		// Use HDR half-float storage when supported so reflection probes preserve
+		// values above 1.0 like the Forward+ renderer. Fall back to RGB10_A2.
+		const bool use_hdr = Config::get_singleton()->hdr_render_supported;
+		const GLenum reflection_format = use_hdr ? GL_RGBA16F : GL_RGB10_A2;
+		const GLenum reflection_type = use_hdr ? GL_HALF_FLOAT : GL_UNSIGNED_INT_2_10_10_10_REV;
+		const uint32_t bytes_per_pixel = use_hdr ? 8 : 4;
+
 		glActiveTexture(GL_TEXTURE0);
 
 		{
@@ -912,14 +920,14 @@ bool LightStorage::reflection_probe_instance_begin_render(RID p_instance, RID p_
 #ifdef GL_API_ENABLED
 			if (RasterizerUtilGLES3::is_gles_over_gl()) {
 				for (int s = 0; s < 6; s++) {
-					glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + s, 0, GL_RGB10_A2, atlas->size, atlas->size, 0, GL_RGBA, GL_UNSIGNED_INT_2_10_10_10_REV, nullptr);
+					glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + s, 0, reflection_format, atlas->size, atlas->size, 0, GL_RGBA, reflection_type, nullptr);
 				}
 				glGenerateMipmap(GL_TEXTURE_CUBE_MAP);
 			}
 #endif
 #ifdef GLES_API_ENABLED
 			if (!RasterizerUtilGLES3::is_gles_over_gl()) {
-				glTexStorage2D(GL_TEXTURE_CUBE_MAP, atlas->mipmap_count, GL_RGB10_A2, atlas->size, atlas->size);
+				glTexStorage2D(GL_TEXTURE_CUBE_MAP, atlas->mipmap_count, reflection_format, atlas->size, atlas->size);
 			}
 #endif // GLES_API_ENABLED
 
@@ -935,7 +943,7 @@ bool LightStorage::reflection_probe_instance_begin_render(RID p_instance, RID p_
 			uint32_t data_size = 0;
 			for (int m = 0; m < atlas->mipmap_count; m++) {
 				atlas->mipmap_size[m] = mipmap_size;
-				data_size += mipmap_size * mipmap_size * 6 * 4;
+				data_size += mipmap_size * mipmap_size * 6 * bytes_per_pixel;
 				mipmap_size = MAX(mipmap_size >> 1, 1);
 			}
 
@@ -950,14 +958,14 @@ bool LightStorage::reflection_probe_instance_begin_render(RID p_instance, RID p_
 #ifdef GL_API_ENABLED
 			if (RasterizerUtilGLES3::is_gles_over_gl()) {
 				for (int s = 0; s < 6; s++) {
-					glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + s, 0, GL_RGB10_A2, atlas->size, atlas->size, 0, GL_RGBA, GL_UNSIGNED_INT_2_10_10_10_REV, nullptr);
+					glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + s, 0, reflection_format, atlas->size, atlas->size, 0, GL_RGBA, reflection_type, nullptr);
 				}
 				glGenerateMipmap(GL_TEXTURE_CUBE_MAP);
 			}
 #endif
 #ifdef GLES_API_ENABLED
 			if (!RasterizerUtilGLES3::is_gles_over_gl()) {
-				glTexStorage2D(GL_TEXTURE_CUBE_MAP, atlas->mipmap_count, GL_RGB10_A2, atlas->size, atlas->size);
+				glTexStorage2D(GL_TEXTURE_CUBE_MAP, atlas->mipmap_count, reflection_format, atlas->size, atlas->size);
 			}
 #endif // GLES_API_ENABLED
 

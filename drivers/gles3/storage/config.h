@@ -75,6 +75,9 @@ public:
 
 	bool float_texture_supported = false;
 	bool float_texture_linear_supported = false;
+	bool half_float_render_target_supported = false;
+	bool float_blend_supported = false;
+	bool hdr_render_supported = false;
 	bool s3tc_supported = false;
 	bool rgtc_supported = false;
 	bool bptc_supported = false;

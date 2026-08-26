@@ -42,7 +42,8 @@ layout(location = 0) out vec4 frag_color;
 
 #define M_PI 3.14159265359
 
-// Don't include tonemap_inc.glsl because all we want is these functions, we don't want the uniforms
+// Note: these helpers are intentionally retained for API/ABI stability even though
+// the radiance/reflection path now filters in linear space without converting.
 // This approximation expects non-negative input; negative input is undefined behavior.
 vec3 linear_to_srgb(vec3 color) {
 	return max(vec3(1.055) * pow(color, vec3(0.416666667)) - vec3(0.055), vec3(0.0));
@@ -111,14 +112,11 @@ void main() {
 		vec4 sample_direction_mip = sample_directions_mip[sample_num];
 		vec3 L = T * sample_direction_mip.xyz;
 		vec3 val = textureLod(source_cube, L, sample_direction_mip.w).rgb;
-		// Mix using linear
-		val = srgb_to_linear(val);
 		sum.rgb += val * sample_direction_mip.z;
 	}
 
 	sum /= weight;
 
-	sum.rgb = linear_to_srgb(sum.rgb);
 	frag_color = vec4(sum.rgb, 1.0);
 #endif
 }

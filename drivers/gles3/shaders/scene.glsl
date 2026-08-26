@@ -31,7 +31,6 @@ LIGHT_USE_PSSM4 = false
 LIGHT_USE_PSSM_BLEND = false
 BASE_PASS = true
 USE_ADDITIVE_LIGHTING = false
-APPLY_TONEMAPPING = true
 // We can only use one type of light per additive pass. This means that if USE_ADDITIVE_LIGHTING is defined, and
 // these are false, we are doing a directional light pass.
 ADDITIVE_OMNI = false
@@ -2079,7 +2078,7 @@ void reflection_process(samplerCube reflection_map,
 		ref_normal = posonbox - box_offset.xyz;
 	}
 
-	reflection.rgb = srgb_to_linear(textureLod(reflection_map, ref_normal, roughness * MAX_ROUGHNESS_LOD).rgb);
+	reflection.rgb = textureLod(reflection_map, ref_normal, roughness * MAX_ROUGHNESS_LOD).rgb;
 
 	if (exterior) {
 		reflection.rgb = mix(skybox, reflection.rgb, blend);
@@ -2095,7 +2094,7 @@ void reflection_process(samplerCube reflection_map,
 		vec4 ambient_out;
 		vec3 amb_normal = (local_matrix * vec4(normal, 0.0)).xyz;
 
-		ambient_out.rgb = srgb_to_linear(textureLod(reflection_map, amb_normal, MAX_ROUGHNESS_LOD).rgb);
+		ambient_out.rgb = textureLod(reflection_map, amb_normal, MAX_ROUGHNESS_LOD).rgb;
 		if (exterior) {
 			ambient_out.rgb = mix(ambient, ambient_out.rgb, blend);
 		}
@@ -2433,7 +2432,6 @@ void main() {
 		float horizon = min(1.0 + dot(ref_vec, indirect_normal), 1.0);
 		ref_vec = mat3(scene_data_block.data.radiance_inverse_xform) * ref_vec;
 		specular_light = textureLod(radiance_map, ref_vec, sqrt(roughness) * RADIANCE_MAX_LOD).rgb;
-		specular_light = srgb_to_linear(specular_light);
 		specular_light *= horizon * horizon;
 		specular_light *= scene_data_block.data.ambient_light_color_energy.a;
 	}
@@ -2478,7 +2476,6 @@ void main() {
 		if (scene_data_block.data.use_ambient_cubemap) {
 			vec3 ambient_dir = mat3(scene_data_block.data.radiance_inverse_xform) * indirect_normal;
 			vec3 cubemap_ambient = textureLod(radiance_map, ambient_dir, RADIANCE_MAX_LOD).rgb;
-			cubemap_ambient = srgb_to_linear(cubemap_ambient);
 			ambient_light = mix(ambient_light, cubemap_ambient * scene_data_block.data.ambient_light_color_energy.a, scene_data_block.data.ambient_color_sky_mix);
 		}
 #endif // USE_RADIANCE_MAP
@@ -2790,13 +2787,6 @@ void main() {
 	frag_color.rgb = mix(frag_color.rgb, fog.rgb, fog.a);
 #endif // !FOG_DISABLED
 
-	// Tonemap before writing as we are writing to an sRGB framebuffer
-	frag_color.rgb *= exposure;
-#ifdef APPLY_TONEMAPPING
-	frag_color.rgb = apply_tonemapping(frag_color.rgb);
-#endif
-	frag_color.rgb = linear_to_srgb(frag_color.rgb);
-
 #else // !BASE_PASS
 	frag_color = vec4(0.0, 0.0, 0.0, alpha);
 #endif // !BASE_PASS
@@ -3062,16 +3052,8 @@ void main() {
 	additive_light_color *= (1.0 - fog.a);
 #endif // !FOG_DISABLED
 
-	// Tonemap before writing as we are writing to an sRGB framebuffer
-	additive_light_color *= exposure;
-#ifdef APPLY_TONEMAPPING
-	additive_light_color = apply_tonemapping(additive_light_color);
-#endif
-	additive_light_color = linear_to_srgb(additive_light_color);
-
 	frag_color.rgb += additive_light_color;
 #endif // USE_ADDITIVE_LIGHTING
-	frag_color.rgb *= scene_data_block.data.luminance_multiplier;
 
 #endif // !RENDER_MATERIAL
 #endif // !MODE_RENDER_DEPTH

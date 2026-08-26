@@ -45,8 +45,6 @@ private:
 		RID shader_version;
 	} glow;
 
-	float luminance_multiplier = 1.0;
-
 	float glow_intensity = 1.0;
 	float glow_bloom = 0.0;
 	float glow_hdr_bleed_threshold = 1.0;
@@ -72,7 +70,6 @@ public:
 	~Glow();
 
 	void set_intensity(float p_value) { glow_intensity = p_value; }
-	void set_luminance_multiplier(float p_luminance_multiplier) { luminance_multiplier = p_luminance_multiplier; }
 	void set_glow_bloom(float p_bloom) { glow_bloom = p_bloom; }
 	void set_glow_hdr_bleed_threshold(float p_threshold) { glow_hdr_bleed_threshold = p_threshold; }
 	void set_glow_hdr_bleed_scale(float p_scale) { glow_hdr_bleed_scale = p_scale; }

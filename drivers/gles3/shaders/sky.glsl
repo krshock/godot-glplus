@@ -8,7 +8,6 @@ mode_cubemap = #define USE_CUBEMAP_PASS
 
 USE_MULTIVIEW = false
 USE_INVERTED_Y = true
-APPLY_TONEMAPPING = true
 USE_QUARTER_RES_PASS = false
 USE_HALF_RES_PASS = false
 
@@ -78,7 +77,6 @@ uniform vec4 projection;
 uniform vec3 position;
 uniform float time;
 uniform float sky_energy_multiplier;
-uniform float luminance_multiplier;
 
 uniform float fog_aerial_perspective;
 uniform vec4 fog_light_color;
@@ -263,16 +261,10 @@ void main() {
 
 #endif // DISABLE_FOG
 
-	color *= exposure;
-#ifdef APPLY_TONEMAPPING
-	color = apply_tonemapping(color);
-#endif
-	color = linear_to_srgb(color);
-
-	frag_color.rgb = color * luminance_multiplier;
+	frag_color.rgb = color;
 	frag_color.a = alpha;
 
 #ifdef USE_DEBANDING
-	frag_color.rgb += interleaved_gradient_noise(gl_FragCoord.xy) * sky_energy_multiplier * luminance_multiplier;
+	frag_color.rgb += interleaved_gradient_noise(gl_FragCoord.xy) * sky_energy_multiplier;
 #endif
 }

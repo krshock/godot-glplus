@@ -35,7 +35,6 @@ uniform sampler2D source_color; // texunit:0
 #endif // USE_MULTIVIEW
 uniform float view;
 uniform vec2 pixel_size;
-uniform float luminance_multiplier;
 uniform float glow_bloom;
 uniform float glow_hdr_threshold;
 uniform float glow_hdr_scale;
@@ -76,14 +75,14 @@ void main() {
 	color += textureLod(source_color, uv - vec2(half_pixel.x, -half_pixel.y), 0.0).rgb;
 	color += textureLod(source_color, uv + vec2(half_pixel.x, -half_pixel.y), 0.0).rgb;
 #endif // USE_MULTIVIEW
-	color /= luminance_multiplier * 8.0;
+	color /= 8.0;
 
 	float feedback_factor = max(color.r, max(color.g, color.b));
 	float feedback = max(smoothstep(glow_hdr_threshold, glow_hdr_threshold + glow_hdr_scale, feedback_factor), glow_bloom);
 
 	color = min(color * feedback, vec3(glow_luminance_cap));
 
-	frag_color = vec4(luminance_multiplier * color, 1.0);
+	frag_color = vec4(color, 1.0);
 #endif // MODE_FILTER
 
 #ifdef MODE_DOWNSAMPLE

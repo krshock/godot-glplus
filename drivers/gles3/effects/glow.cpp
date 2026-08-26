@@ -114,7 +114,6 @@ void Glow::process_glow(GLuint p_source_color, Size2i p_size, const Glow::Level 
 
 		glow.shader.version_set_uniform(GlowShaderGLES3::PIXEL_SIZE, 1.0 / p_glow_buffers[0].size.x, 1.0 / p_glow_buffers[0].size.y, glow.shader_version, GlowShaderGLES3::MODE_FILTER, specialization);
 		glow.shader.version_set_uniform(GlowShaderGLES3::VIEW, float(p_view), glow.shader_version, GlowShaderGLES3::MODE_FILTER, specialization);
-		glow.shader.version_set_uniform(GlowShaderGLES3::LUMINANCE_MULTIPLIER, luminance_multiplier, glow.shader_version, GlowShaderGLES3::MODE_FILTER, specialization);
 		glow.shader.version_set_uniform(GlowShaderGLES3::GLOW_BLOOM, glow_bloom, glow.shader_version, GlowShaderGLES3::MODE_FILTER, specialization);
 		glow.shader.version_set_uniform(GlowShaderGLES3::GLOW_HDR_THRESHOLD, glow_hdr_bleed_threshold, glow.shader_version, GlowShaderGLES3::MODE_FILTER, specialization);
 		glow.shader.version_set_uniform(GlowShaderGLES3::GLOW_HDR_SCALE, glow_hdr_bleed_scale, glow.shader_version, GlowShaderGLES3::MODE_FILTER, specialization);

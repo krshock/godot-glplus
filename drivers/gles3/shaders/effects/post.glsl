@@ -6,7 +6,6 @@ mode_default =
 
 USE_MULTIVIEW = false
 USE_GLOW = false
-USE_LUMINANCE_MULTIPLIER = false
 USE_BCS = false
 USE_COLOR_CORRECTION = false
 USE_1D_LUT = false
@@ -44,7 +43,6 @@ uniform sampler2D source_color; // texunit:0
 #endif // USE_MULTIVIEW
 
 uniform float view;
-uniform float luminance_multiplier;
 
 #ifdef USE_GLOW
 uniform sampler2D glow_color; // texunit:1
@@ -63,10 +61,6 @@ vec4 get_glow_color(vec2 uv) {
 	color += textureLod(glow_color, uv + vec2(half_pixel.x, -half_pixel.y), 0.0) * 2.0;
 	color += textureLod(glow_color, uv + vec2(0.0, -half_pixel.y * 2.0), 0.0);
 	color += textureLod(glow_color, uv + vec2(-half_pixel.x, -half_pixel.y), 0.0) * 2.0;
-
-#ifdef USE_LUMINANCE_MULTIPLIER
-	color = color / luminance_multiplier;
-#endif
 
 	return color / 12.0;
 }
@@ -125,15 +119,12 @@ void main() {
 	vec4 color = texture(source_color, uv_interp);
 #endif
 
-#ifdef USE_LUMINANCE_MULTIPLIER
-	color = color / luminance_multiplier;
-#endif
+	// The source is linear HDR, apply exposure before any other processing.
+	color.rgb *= exposure;
 
 #ifdef USE_GLOW
-	// Glow blending is performed before srgb_to_linear because
-	// the glow texture was created from a nonlinear sRGB-encoded
-	// scene, so it only makes sense to add this glow to an equally
-	// nonlinear sRGB-encoded scene.
+	// Glow blending is performed in linear space so it matches the scene shader,
+	// which now outputs linear HDR color.
 
 	vec4 glow = get_glow_color(uv_interp) * glow_intensity;
 
@@ -146,21 +137,11 @@ void main() {
 	// Note: srgb_white cannot be smaller than the maximum output value (1.0).
 	glow.rgb = clamp(glow.rgb, 0.0, srgb_white);
 
-	// Normalize to srgb_white range.
-	//glow.rgb /= srgb_white;
-	//color.rgb /= srgb_white;
-	//color.rgb = (color.rgb + glow.rgb) - (color.rgb * glow.rgb);
-	// Expand back to original range.
-	//color.rgb *= srgb_white;
-
-	// The following is a mathematically simplified version of the above.
+	// The following is a mathematically simplified screen blend.
 	color.rgb = color.rgb + glow.rgb - (color.rgb * glow.rgb / srgb_white);
 #endif // USE_GLOW
 
-	color.rgb = srgb_to_linear(color.rgb);
-
 #if defined(USE_SOME_SSAO)
-	// Putting SSAO after the conversion to linear color, though it might be better before the glow.
 	color.rgb *= s4ao(uv_interp); // The USE_SSAO_X controls the number of samples.
 #endif
 

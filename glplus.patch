@@ -1,0 +1,1015 @@
+diff --git a/WEBGLPLUS.md b/WEBGLPLUS.md
+new file mode 100644
+index 0000000000..5285eb09b0
+--- /dev/null
++++ b/WEBGLPLUS.md
+@@ -0,0 +1,145 @@
++# WEBGLPLUS — Linear HDR shading in the Compatibility (GLES3 / WebGL2) renderer
++
++## WebGL extensions used (compatibility / device support)
++
++These are the extra WebGL2 extensions this change relies on for the HDR path.
++On devices that lack them, the renderer automatically falls back to an LDR
++(`RGB10_A2`/`RGBA8`) buffer with the same linear pipeline.
++
++| Extension | Purpose | Browser / device support |
++|-----------|---------|--------------------------|
++| `EXT_color_buffer_half_float` | Render to `RGBA16F` (half-float) color buffers | Chrome/Edge, Firefox, Safari 15+, most mobile GPUs |
++| `EXT_color_buffer_float` | Render to `RGBA32F`/`RGBA16F`/`R11G11B10F` buffers | Chrome/Edge, Firefox (newer), Safari (newer) |
++| `EXT_float_blend` | Blending on float render targets (transparents, additive lights, glow) | Chrome/Edge, Firefox, Safari 15+ |
++
++All three are enabled in `platform/web/display_server_web.cpp` and detected in
++`drivers/gles3/storage/config.cpp`; `hdr_render_supported` requires
++`(color_buffer_float OR color_buffer_half_float) AND float_blend`.
++
++## Goal
++
++Make Godot's Compatibility renderer (the one used by the WebGL2 export) shade in
++**linear HDR** and tonemap **once at the end**, the way the Vulkan/Forward+
++renderer and Unity's WebGL pipeline do. This fixes the washed-out/desaturated
++colors and clipped highlights the old pipeline produced.
++
++## How it worked before
++
++The whole color pipeline was non-linear and clamped to `[0,1]`:
++
++```
++sample texture -> srgb_to_linear -> light (linear)
++-> *exposure -> tonemap -> linear_to_srgb -> write to RGB10_A2/RGBA8  ([0,1] clamp)
++-> (glow/SSAO/BCS on) post.glsl: srgb_to_linear -> tonemap -> linear_to_srgb  (2nd round-trip)
++```
++
++Problems:
++
++1. **Tonemap + sRGB happened inline in the material pass**, before the `[0,1]`
++   UNORM buffer clamp. Any energy above 1.0 was lost before the tonemapper could
++   compress it -> flat, clipped highlights.
++2. **Two color-space round-trips** (linear -> sRGB -> linear -> tonemap -> sRGB)
++   when post effects were enabled, shifting the tonemap curve's operating point.
++3. **`luminance_multiplier = 0.25` "fake HDR" hack** (only with glow + 10-bit
++   buffer) squeezed `[0,4]` into `[0,1]`, further reducing contrast.
++4. **Cheap sRGB approximations** in `tonemap_inc.glsl` instead of the exact curve.
++
++## How it works now
++
++```
++sample texture -> srgb_to_linear -> light (linear)
++-> write LINEAR to RGBA16F intermediate buffer  (unbounded, no tonemap, no clamp)
++-> glow/SSAO (linear HDR)
++-> ONE post pass: *exposure -> tonemap -> linear_to_srgb -> LDR viewport target
++-> blit to screen (unchanged)
++```
++
++- The scene and sky shaders output **raw linear** color (no exposure/tonemap/sRGB).
++- The 3D scene always renders through an **intermediate buffer** that is
++  `GL_RGBA16F` when the device supports it, otherwise `RGB10_A2`/`RGBA8` (the
++  *same* linear pipeline, only the buffer precision differs).
++- `post.glsl` is the **single** place that applies exposure, tonemapping, and
++  linear->sRGB conversion.
++- Glow is computed and blended in **linear HDR** space (real `>1.0` thresholds).
++- `tonemap_inc.glsl` now uses the **exact** piecewise sRGB transfer functions.
++
++## Capability detection (auto HDR + fallback)
++
++In `drivers/gles3/storage/config.cpp`:
++
++- `EXT_color_buffer_half_float` -> `half_float_render_target_supported`
++- `EXT_color_buffer_float`     -> `float_texture_supported` (already existed)
++- `EXT_float_blend`            -> `float_blend_supported`
++- `hdr_render_supported = (float_texture_supported || half_float_render_target_supported) && float_blend_supported`
++
++Web builds enable the extensions in `platform/web/display_server_web.cpp`.
++On desktop GLES the flags are forced true.
++
++The fallback is **not a legacy path** — it is the same shader pipeline; only the
++intermediate buffer format changes:
++
++| Mode     | Intermediate buffer | Behavior |
++|----------|--------------------|----------|
++| HDR      | `GL_RGBA16F`        | full linear range |
++| Fallback | `RGB10_A2`/`RGBA8`  | identical pipeline, values >1.0 clamp |
++
++### Gotcha: `RGBA16F` must use `GL_HALF_FLOAT`
++
++The intermediate buffer is created with `GL_RGBA16F` + `GL_HALF_FLOAT` type.
++Desktop GL drivers are lenient and silently convert, but WebGL2/ANGLE strictly
++validates the `format`/`type` pair — `(GL_RGBA, GL_FLOAT)` only maps to
++`RGBA32F`, so `RGBA16F` + `GL_FLOAT` fails the framebuffer check and the renderer
++silently falls back to LDR (clipped -> overexposed/desaturated). Fixed in
++`render_scene_buffers_gles3.cpp`.
++
++## Files changed
++
++- `drivers/gles3/storage/config.{h,cpp}` — capability flags
++- `drivers/gles3/storage/render_scene_buffers_gles3.{h,cpp}` — HDR intermediate buffer (`RGBA16F` + `GL_HALF_FLOAT`), force internal buffer, remove dead plumbing
++- `drivers/gles3/rasterizer_scene_gles3.{h,cpp}` — remove inline tonemap flag/0.25 hack/clear-color linearization
++- `drivers/gles3/shaders/scene.glsl` — output linear only; IBL/reflection/ambient sampled linear (no `srgb_to_linear` on radiance/probe maps)
++- `drivers/gles3/shaders/sky.glsl` — output linear only
++- `drivers/gles3/shaders/effects/post.glsl` — single exposure+tonemap+sRGB pass
++- `drivers/gles3/shaders/effects/glow.glsl` — linear HDR glow (drop luminance_multiplier)
++- `drivers/gles3/shaders/effects/cubemap_filter.glsl` — radiance/probe filtering in linear space (helpers retained, unused)
++- `drivers/gles3/shaders/effects/copy.glsl` — radiance panorama bake reads linear
++- `drivers/gles3/shaders/tonemap_inc.glsl` — exact sRGB functions
++- `drivers/gles3/rasterizer_scene_gles3.cpp` — sky radiance cubemaps stored `RGBA16F` (HDR) when supported
++- `drivers/gles3/storage/light_storage.cpp` — reflection atlas `color`/`radiance` cubemaps stored `RGBA16F` (HDR) when supported
++- `drivers/gles3/effects/glow.{h,cpp}`, `post_effects.{h,cpp}` — drop luminance_multiplier plumbing
++- `platform/web/display_server_web.cpp` — enable float render target extensions
++
++## Compatibility
++
++Binary/API compatibility with the Godot scripting and extension API is fully
++preserved. All changes are internal to `drivers/gles3/`:
++
++- No ClassDB/`_bind_methods`/`GDVIRTUAL`/`BIND_*` changes.
++- No public `RenderingServer`/`RenderingDevice` methods touched
++  (`viewport_set_use_hdr` etc. and their `texture_storage.cpp` implementation are untouched).
++- No virtual overrides removed (only GLES3-specific non-virtual helpers).
++- The only external consumers of a gles3 header (OpenXR/WebXR modules, via
++  `texture_storage.h`) are unaffected — that file is unchanged.
++
++## Known follow-ups (not yet done)
++
++1. **`ENV_BG_CANVAS`:** the canvas-as-background copy (`copy_screen`/
++   `copy_with_exposure`) writes sRGB canvas data into the now-linear internal
++   buffer without converting.
++2. **Temporary diagnostics:** the one-shot `print_line` logs added for debugging
++   (`config.cpp`, `render_scene_buffers_gles3.cpp`, `rasterizer_scene_gles3.cpp`)
++   should be removed once work is done.
++
++## Verification
++
++Working correctly on **Linux desktop GL** and **WebGL2 (Chrome)**. The earlier
++"web overexposed vs Linux" report was a stale-build comparison: the Linux player
++was stock (`bfae01d184`) while the web build had the HDR changes (`05102de5fb`).
++With both built from the same commit the output matches.
++
++## Usage note
++
++HDR + a **Linear** tonemapper (`tonemapper=0`, the default) clips any value
++`>1.0` to white — that's what looks "overexposed/desaturated" on bright scenes.
++This is correct HDR behavior (Forward+ does the same); to compress highlights,
++set the WorldEnvironment tonemapper to **ACES**, **Filmic**, or **AgX**.
+diff --git a/drivers/gles3/effects/glow.cpp b/drivers/gles3/effects/glow.cpp
+index b30f1447ec..8d898b34fd 100644
+--- a/drivers/gles3/effects/glow.cpp
++++ b/drivers/gles3/effects/glow.cpp
+@@ -114,7 +114,6 @@ void Glow::process_glow(GLuint p_source_color, Size2i p_size, const Glow::Level
+ 
+ 		glow.shader.version_set_uniform(GlowShaderGLES3::PIXEL_SIZE, 1.0 / p_glow_buffers[0].size.x, 1.0 / p_glow_buffers[0].size.y, glow.shader_version, GlowShaderGLES3::MODE_FILTER, specialization);
+ 		glow.shader.version_set_uniform(GlowShaderGLES3::VIEW, float(p_view), glow.shader_version, GlowShaderGLES3::MODE_FILTER, specialization);
+-		glow.shader.version_set_uniform(GlowShaderGLES3::LUMINANCE_MULTIPLIER, luminance_multiplier, glow.shader_version, GlowShaderGLES3::MODE_FILTER, specialization);
+ 		glow.shader.version_set_uniform(GlowShaderGLES3::GLOW_BLOOM, glow_bloom, glow.shader_version, GlowShaderGLES3::MODE_FILTER, specialization);
+ 		glow.shader.version_set_uniform(GlowShaderGLES3::GLOW_HDR_THRESHOLD, glow_hdr_bleed_threshold, glow.shader_version, GlowShaderGLES3::MODE_FILTER, specialization);
+ 		glow.shader.version_set_uniform(GlowShaderGLES3::GLOW_HDR_SCALE, glow_hdr_bleed_scale, glow.shader_version, GlowShaderGLES3::MODE_FILTER, specialization);
+diff --git a/drivers/gles3/effects/glow.h b/drivers/gles3/effects/glow.h
+index 03abece975..95032afae6 100644
+--- a/drivers/gles3/effects/glow.h
++++ b/drivers/gles3/effects/glow.h
+@@ -45,8 +45,6 @@ private:
+ 		RID shader_version;
+ 	} glow;
+ 
+-	float luminance_multiplier = 1.0;
+-
+ 	float glow_intensity = 1.0;
+ 	float glow_bloom = 0.0;
+ 	float glow_hdr_bleed_threshold = 1.0;
+@@ -72,7 +70,6 @@ public:
+ 	~Glow();
+ 
+ 	void set_intensity(float p_value) { glow_intensity = p_value; }
+-	void set_luminance_multiplier(float p_luminance_multiplier) { luminance_multiplier = p_luminance_multiplier; }
+ 	void set_glow_bloom(float p_bloom) { glow_bloom = p_bloom; }
+ 	void set_glow_hdr_bleed_threshold(float p_threshold) { glow_hdr_bleed_threshold = p_threshold; }
+ 	void set_glow_hdr_bleed_scale(float p_scale) { glow_hdr_bleed_scale = p_scale; }
+diff --git a/drivers/gles3/effects/post_effects.cpp b/drivers/gles3/effects/post_effects.cpp
+index 1f53c2dd5a..dd29bd237d 100644
+--- a/drivers/gles3/effects/post_effects.cpp
++++ b/drivers/gles3/effects/post_effects.cpp
+@@ -91,7 +91,7 @@ void PostEffects::_draw_screen_triangle() {
+ void PostEffects::post_copy(
+ 		GLuint p_dest_framebuffer, Size2i p_dest_size, GLuint p_source_color,
+ 		GLuint p_source_depth, bool p_ssao_enabled, int p_ssao_quality_level, float p_ssao_strength, float p_ssao_radius,
+-		Size2i p_source_size, float p_luminance_multiplier, const Glow::Level *p_glow_buffers, float p_glow_intensity,
++		Size2i p_source_size, const Glow::Level *p_glow_buffers, float p_glow_intensity,
+ 		float p_srgb_white, uint32_t p_view, bool p_use_multiview, uint64_t p_spec_constants, bool p_bilinear_filtering) {
+ 	glDisable(GL_DEPTH_TEST);
+ 	glDepthMask(GL_FALSE);
+@@ -121,9 +121,6 @@ void PostEffects::post_copy(
+ 			flags |= PostShaderGLES3::USE_SSAO_MED;
+ 		}
+ 	}
+-	if (p_luminance_multiplier != 1.0) {
+-		flags |= PostShaderGLES3::USE_LUMINANCE_MULTIPLIER;
+-	}
+ 
+ 	bool success = post.shader.version_bind_shader(post.shader_version, mode, flags);
+ 	if (!success) {
+@@ -161,7 +158,6 @@ void PostEffects::post_copy(
+ 	}
+ 
+ 	post.shader.version_set_uniform(PostShaderGLES3::VIEW, float(p_view), post.shader_version, mode, flags);
+-	post.shader.version_set_uniform(PostShaderGLES3::LUMINANCE_MULTIPLIER, p_luminance_multiplier, post.shader_version, mode, flags);
+ 
+ 	_draw_screen_triangle();
+ 
+diff --git a/drivers/gles3/effects/post_effects.h b/drivers/gles3/effects/post_effects.h
+index b3ed91a066..db92429e44 100644
+--- a/drivers/gles3/effects/post_effects.h
++++ b/drivers/gles3/effects/post_effects.h
+@@ -60,7 +60,7 @@ public:
+ 
+ 	void post_copy(GLuint p_dest_framebuffer, Size2i p_dest_size, GLuint p_source_color,
+ 			GLuint p_source_depth, bool p_ssao_enabled, int p_ssao_quality_level, float p_ssao_strength, float p_ssao_radius,
+-			Size2i p_source_size, float p_luminance_multiplier, const Glow::Level *p_glow_buffers, float p_glow_intensity,
++			Size2i p_source_size, const Glow::Level *p_glow_buffers, float p_glow_intensity,
+ 			float p_srgb_white, uint32_t p_view = 0, bool p_use_multiview = false, uint64_t p_spec_constants = 0, bool p_bilinear_filtering = true);
+ };
+ 
+diff --git a/drivers/gles3/rasterizer_scene_gles3.cpp b/drivers/gles3/rasterizer_scene_gles3.cpp
+index b188b0b086..c8e16286a0 100644
+--- a/drivers/gles3/rasterizer_scene_gles3.cpp
++++ b/drivers/gles3/rasterizer_scene_gles3.cpp
+@@ -33,6 +33,7 @@
+ #ifdef GLES3_ENABLED
+ 
+ #include "core/config/project_settings.h"
++#include "core/string/print_string.h"
+ #include "core/templates/sort_array.h"
+ #include "drivers/gles3/effects/copy_effects.h"
+ #include "drivers/gles3/effects/cubemap_filter.h"
+@@ -606,6 +607,14 @@ void RasterizerSceneGLES3::_invalidate_sky(Sky *p_sky) {
+ GLuint _init_radiance_texture(int p_size, int p_mipmaps, String p_name) {
+ 	GLuint radiance_id = 0;
+ 
++	// Use HDR half-float storage when the device supports rendering to float
++	// buffers, so the radiance preserves values above 1.0 and ambient/reflections
++	// stay saturated like the Forward+ renderer. Otherwise fall back to RGB10_A2.
++	const bool use_hdr = GLES3::Config::get_singleton()->hdr_render_supported;
++	GLenum internal_format = use_hdr ? GL_RGBA16F : GL_RGB10_A2;
++	GLenum pixel_type = use_hdr ? GL_HALF_FLOAT : GL_UNSIGNED_INT_2_10_10_10_REV;
++	Image::Format size_format = use_hdr ? Image::FORMAT_RGBAH : Image::FORMAT_RGBA8;
++
+ 	glGenTextures(1, &radiance_id);
+ 	glBindTexture(GL_TEXTURE_CUBE_MAP, radiance_id);
+ #ifdef GL_API_ENABLED
+@@ -613,7 +622,7 @@ GLuint _init_radiance_texture(int p_size, int p_mipmaps, String p_name) {
+ 		//TODO, on low-end compare this to allocating each face of each mip individually
+ 		// see: https://www.khronos.org/registry/OpenGL-Refpages/es3.0/html/glTexStorage2D.xhtml
+ 		for (int i = 0; i < 6; i++) {
+-			glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + i, 0, GL_RGB10_A2, p_size, p_size, 0, GL_RGBA, GL_UNSIGNED_INT_2_10_10_10_REV, nullptr);
++			glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + i, 0, internal_format, p_size, p_size, 0, GL_RGBA, pixel_type, nullptr);
+ 		}
+ 
+ 		glGenerateMipmap(GL_TEXTURE_CUBE_MAP);
+@@ -621,7 +630,7 @@ GLuint _init_radiance_texture(int p_size, int p_mipmaps, String p_name) {
+ #endif // GL_API_ENABLED
+ #ifdef GLES_API_ENABLED
+ 	if (!RasterizerUtilGLES3::is_gles_over_gl()) {
+-		glTexStorage2D(GL_TEXTURE_CUBE_MAP, p_mipmaps, GL_RGB10_A2, p_size, p_size);
++		glTexStorage2D(GL_TEXTURE_CUBE_MAP, p_mipmaps, internal_format, p_size, p_size);
+ 	}
+ #endif // GLES_API_ENABLED
+ 	glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+@@ -631,7 +640,7 @@ GLuint _init_radiance_texture(int p_size, int p_mipmaps, String p_name) {
+ 	glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_BASE_LEVEL, 0);
+ 	glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAX_LEVEL, p_mipmaps - 1);
+ 
+-	GLES3::Utilities::get_singleton()->texture_allocated_data(radiance_id, Image::get_image_data_size(p_size, p_size, Image::FORMAT_RGBA8, true), p_name);
++	GLES3::Utilities::get_singleton()->texture_allocated_data(radiance_id, Image::get_image_data_size(p_size, p_size, size_format, true), p_name);
+ 	return radiance_id;
+ }
+ 
+@@ -886,6 +895,6 @@ void RasterizerSceneGLES3::_setup_sky(const RenderDataGLES3 *p_render_data, cons
+ 	}
+ }
+ 
+-void RasterizerSceneGLES3::_draw_sky(RID p_env, const Projection &p_projection, const Transform3D &p_transform, float p_sky_energy_multiplier, float p_luminance_multiplier, bool p_use_multiview, bool p_flip_y, bool p_apply_environment_effects_in_post) {
++void RasterizerSceneGLES3::_draw_sky(RID p_env, const Projection &p_projection, const Transform3D &p_transform, float p_sky_energy_multiplier, bool p_use_multiview, bool p_flip_y) {
+ 	GLES3::MaterialStorage *material_storage = GLES3::MaterialStorage::get_singleton();
+ 	ERR_FAIL_COND(p_env.is_null());
+@@ -900,8 +909,5 @@ void RasterizerSceneGLES3::_draw_sky(RID p_env, const Projection &p_projection,
+ 	if (p_flip_y) {
+ 		spec_constants |= SkyShaderGLES3::USE_INVERTED_Y;
+ 	}
+-	if (!p_apply_environment_effects_in_post) {
+-		spec_constants |= SkyShaderGLES3::APPLY_TONEMAPPING;
+-	}
+ 
+ 	RSE::EnvironmentBG background = environment_get_background(p_env);
+@@ -936,7 +942,6 @@ void RasterizerSceneGLES3::_draw_sky(RID p_env, const Projection &p_projection,
+ 	material_storage->shaders.sky_shader.version_set_uniform(SkyShaderGLES3::POSITION, p_transform.origin, shader_data->version, SkyShaderGLES3::MODE_BACKGROUND, spec_constants);
+ 	material_storage->shaders.sky_shader.version_set_uniform(SkyShaderGLES3::TIME, time, shader_data->version, SkyShaderGLES3::MODE_BACKGROUND, spec_constants);
+ 	material_storage->shaders.sky_shader.version_set_uniform(SkyShaderGLES3::SKY_ENERGY_MULTIPLIER, p_sky_energy_multiplier, shader_data->version, SkyShaderGLES3::MODE_BACKGROUND, spec_constants);
+-	material_storage->shaders.sky_shader.version_set_uniform(SkyShaderGLES3::LUMINANCE_MULTIPLIER, p_luminance_multiplier, shader_data->version, SkyShaderGLES3::MODE_BACKGROUND, spec_constants);
+ 
+ 	Color fog_color = environment_get_fog_light_color(p_env).srgb_to_linear() * environment_get_fog_light_energy(p_env);
+ 	material_storage->shaders.sky_shader.version_set_uniform(SkyShaderGLES3::FOG_ENABLED, environment_get_fog_enabled(p_env), shader_data->version, SkyShaderGLES3::MODE_BACKGROUND, spec_constants);
+@@ -1014,6 +1019,5 @@ void RasterizerSceneGLES3::_update_sky_radiance(RID p_env, const Projection &p_p
+ 		material_storage->shaders.sky_shader.version_set_uniform(SkyShaderGLES3::TIME, time, shader_data->version, SkyShaderGLES3::MODE_CUBEMAP);
+ 		material_storage->shaders.sky_shader.version_set_uniform(SkyShaderGLES3::PROJECTION, cm.columns[2][0], cm.columns[0][0], cm.columns[2][1], cm.columns[1][1], shader_data->version, SkyShaderGLES3::MODE_CUBEMAP);
+ 		material_storage->shaders.sky_shader.version_set_uniform(SkyShaderGLES3::SKY_ENERGY_MULTIPLIER, p_sky_energy_multiplier, shader_data->version, SkyShaderGLES3::MODE_CUBEMAP);
+-		material_storage->shaders.sky_shader.version_set_uniform(SkyShaderGLES3::LUMINANCE_MULTIPLIER, 1.0, shader_data->version, SkyShaderGLES3::MODE_CUBEMAP);
+ 
+ 		glBindVertexArray(sky_globals.screen_triangle_array);
+@@ -2404,36 +2408,20 @@ void RasterizerSceneGLES3::render_scene(const Ref<RenderSceneBuffers> &p_render_
+ 	GLES3::Config *config = GLES3::Config::get_singleton();
+ 	RENDER_TIMESTAMP("Setup 3D Scene");
+ 
+-	bool apply_environment_effects_in_post = false;
+ 	bool is_reflection_probe = p_reflection_probe.is_valid();
+ 
+ 	Ref<RenderSceneBuffersGLES3> rb = p_render_buffers;
+ 	ERR_FAIL_COND(rb.is_null());
+ 
+-	if (rb->get_scaling_3d_mode() != RSE::VIEWPORT_SCALING_3D_MODE_OFF) {
+-		// If we're scaling, we apply tonemapping etc. in post, so disable it during rendering
+-		apply_environment_effects_in_post = true;
+-	}
+-
+ 	GLES3::RenderTarget *rt = nullptr; // No render target for reflection probe
+ 	if (!is_reflection_probe) {
+ 		rt = texture_storage->get_render_target(rb->render_target);
+ 		ERR_FAIL_NULL(rt);
+ 	}
+ 
+-	bool glow_enabled = false;
+ 	bool ssao_enabled = false;
+-	bool use_bcs = false;
+ 	if (p_environment.is_valid()) {
+-		// We apply tonemapping, etc. in post when any of these are true. In this
+-		// case, set apply_environment_effects_in_post to true to skip tonemapping during rendering.
+-		glow_enabled = environment_get_glow_enabled(p_environment);
+ 		ssao_enabled = environment_get_ssao_enabled(p_environment);
+-		use_bcs = environment_get_adjustments_enabled(p_environment);
+-		bool canvas_tonemapping = environment_get_background(p_environment) == RSE::ENV_BG_CANVAS && environment_get_tone_mapper(p_environment) != RSE::ENV_TONE_MAPPER_LINEAR;
+-		if (glow_enabled || ssao_enabled || use_bcs || canvas_tonemapping) {
+-			apply_environment_effects_in_post = true;
+-		}
+ 	}
+ 
+ 	// Assign render data
+@@ -2476,13 +2464,6 @@ void RasterizerSceneGLES3::render_scene(const Ref<RenderSceneBuffers> &p_render_
+ 		// this should be the same for all cameras..
+ 		render_data.lod_distance_multiplier = p_camera_data->main_projection.get_lod_multiplier();
+ 
+-		if (rt != nullptr && rt->color_type == GL_UNSIGNED_INT_2_10_10_10_REV && glow_enabled) {
+-			// As our output is in sRGB and we're using 10bit color space, we can fake a little HDR to do glow...
+-			render_data.luminance_multiplier = 0.25;
+-		} else {
+-			render_data.luminance_multiplier = 1.0;
+-		}
+-
+ 		if (get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_DISABLE_LOD) {
+ 			render_data.screen_mesh_lod_threshold = 0.0;
+ 		} else {
+@@ -2546,6 +2527,12 @@ void RasterizerSceneGLES3::render_scene(const Ref<RenderSceneBuffers> &p_render_
+ 		glBufferData(GL_UNIFORM_BUFFER, sizeof(SceneState::TonemapUBO), &tonemap_ubo, GL_STREAM_DRAW);
+ 	}
+ 
++	static bool logged_scene_debug = false;
++	if (!logged_scene_debug) {
++		logged_scene_debug = true;
++		print_line(vformat("Scene: exposure=%f tonemapper=%d", tonemap_ubo.exposure, tonemap_ubo.tonemapper));
++	}
++
+ 	glBindBuffer(GL_UNIFORM_BUFFER, 0);
+ 
+ 	scene_state.data.emissive_exposure_normalization = -1.0; // Use default exposure normalization.
+@@ -2707,8 +2694,6 @@ void RasterizerSceneGLES3::render_scene(const Ref<RenderSceneBuffers> &p_render_
+ 	if (is_reflection_probe && GLES3::LightStorage::get_singleton()->reflection_probe_has_atlas_index(render_data.reflection_probe)) {
+ 		fbo = GLES3::LightStorage::get_singleton()->reflection_probe_instance_get_framebuffer(render_data.reflection_probe, render_data.reflection_probe_pass);
+ 	} else {
+-		rb->set_apply_environment_effects_in_post(apply_environment_effects_in_post);
+-		rb->set_apply_canvas_bg_exposure(apply_canvas_bg_exposure);
+ 		fbo = rb->get_render_fbo();
+ 	}
+ 
+@@ -2800,6 +2785,8 @@ void RasterizerSceneGLES3::render_scene(const Ref<RenderSceneBuffers> &p_render_
+ 	// b) We are rendering to a non-intermediate framebuffer with ENV_BG_CANVAS (shared between 2D and 3D).
+ 	if (!keep_color && (!draw_canvas || (rt && fbo != rt->fbo))) {
+ 		clear_color.a = render_data.transparent_bg ? 0.0f : 1.0f;
++		// The intermediate 3D buffer is linear, so clear it with a linear color.
++		clear_color = clear_color.srgb_to_linear();
+ 		glClearBufferfv(GL_COLOR, 0, clear_color.components);
+ 	}
+ 	if ((keep_color || draw_canvas) && rt && fbo != rt->fbo) {
+@@ -2814,9 +2801,9 @@ void RasterizerSceneGLES3::render_scene(const Ref<RenderSceneBuffers> &p_render_
+ 		glBindTexture(rt->view_count > 1 ? GL_TEXTURE_2D_ARRAY : GL_TEXTURE_2D, rt->color);
+ 
+ 		if (apply_canvas_bg_exposure) {
+-			copy_effects->copy_with_exposure(tonemap_ubo.exposure, render_data.luminance_multiplier);
++			copy_effects->copy_with_exposure(tonemap_ubo.exposure, 1.0f);
+ 		} else {
+-			copy_effects->copy_screen(render_data.luminance_multiplier);
++			copy_effects->copy_screen(1.0f);
+ 		}
+ 
+ 		scene_state.enable_gl_depth_test(true);
+@@ -2845,10 +2832,6 @@ void RasterizerSceneGLES3::render_scene(const Ref<RenderSceneBuffers> &p_render_
+ 		if (render_data.environment.is_valid() && environment_get_fog_mode(render_data.environment) == RSE::EnvironmentFogMode::ENV_FOG_MODE_DEPTH) {
+ 			spec_constant_base_flags |= SceneShaderGLES3::USE_DEPTH_FOG;
+ 		}
+-
+-		if (!apply_environment_effects_in_post) {
+-			spec_constant_base_flags |= SceneShaderGLES3::APPLY_TONEMAPPING;
+-		}
+ 	}
+ 
+ 	if (draw_feed && camera_feed_id > -1) {
+@@ -2892,7 +2875,7 @@ void RasterizerSceneGLES3::render_scene(const Ref<RenderSceneBuffers> &p_render_
+ 		Transform3D transform = render_data.cam_transform;
+ 		Projection projection = render_data.cam_projection;
+ 
+-		_draw_sky(render_data.environment, projection, transform, sky_energy_multiplier, render_data.luminance_multiplier, p_camera_data->view_count > 1, flip_y, apply_environment_effects_in_post);
++		_draw_sky(render_data.environment, projection, transform, sky_energy_multiplier, p_camera_data->view_count > 1, flip_y);
+ 	}
+ 
+ 	if (scene_state.used_screen_texture || scene_state.used_depth_texture) {
+@@ -2996,9 +2979,8 @@ void RasterizerSceneGLES3::_render_post_processing(const RenderDataGLES3 *p_rend
+ 	}
+ 
+ 	if (glow_enabled) {
+-		// Only glow requires srgb_white to be calculated.
+-		srgb_white = 1.055 * Math::pow(srgb_white, 1.0f / 2.4f) - 0.055;
+-
++		// Only glow requires white to be calculated. Glow is now blended in
++		// linear space, so keep the white point in linear encoding.
+ 		rb->check_glow_buffers();
+ 	}
+ 
+@@ -3069,8 +3051,6 @@ void RasterizerSceneGLES3::_render_post_processing(const RenderDataGLES3 *p_rend
+ 			if (glow_enabled) {
+ 				glow_buffers = rb->get_glow_buffers();
+ 
+-				glow->set_luminance_multiplier(p_render_data->luminance_multiplier);
+-
+ 				glow->set_intensity(glow_intensity);
+ 				glow->set_glow_bloom(glow_bloom);
+ 				glow->set_glow_hdr_bleed_threshold(glow_hdr_bleed_threshold);
+@@ -3083,7 +3063,7 @@ void RasterizerSceneGLES3::_render_post_processing(const RenderDataGLES3 *p_rend
+ 			// Copy color buffer
+ 			post_effects->post_copy(fbo_rt, target_size, color,
+ 					depth_buffer, ssao_enabled, ssao_quality, ssao_strength, ssao_radius,
+-					internal_size, p_render_data->luminance_multiplier, glow_buffers, glow_intensity,
++					internal_size, glow_buffers, glow_intensity,
+ 					srgb_white, 0, false, bcs_spec_constants, p_render_data->render_buffers->scaling_3d_mode != RSE::VIEWPORT_SCALING_3D_MODE_NEAREST);
+ 
+ 			// Copy depth buffer
+@@ -3137,8 +3117,6 @@ void RasterizerSceneGLES3::_render_post_processing(const RenderDataGLES3 *p_rend
+ 			if (glow_enabled) {
+ 				glow_buffers = rb->get_glow_buffers();
+ 
+-				glow->set_luminance_multiplier(p_render_data->luminance_multiplier);
+-
+ 				glow->set_intensity(glow_intensity);
+ 				glow->set_glow_bloom(glow_bloom);
+ 				glow->set_glow_hdr_bleed_threshold(glow_hdr_bleed_threshold);
+@@ -3157,7 +3135,7 @@ void RasterizerSceneGLES3::_render_post_processing(const RenderDataGLES3 *p_rend
+ 				glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, write_color, 0, v);
+ 				post_effects->post_copy(fbos[2], target_size, source_color,
+ 						read_depth, ssao_enabled, ssao_quality, ssao_strength, ssao_radius,
+-						internal_size, p_render_data->luminance_multiplier, glow_buffers, glow_intensity,
++						internal_size, glow_buffers, glow_intensity,
+ 						srgb_white, v, true, bcs_spec_constants, p_render_data->render_buffers->scaling_3d_mode != RSE::VIEWPORT_SCALING_3D_MODE_NEAREST);
+ 			}
+ 
+diff --git a/drivers/gles3/rasterizer_scene_gles3.h b/drivers/gles3/rasterizer_scene_gles3.h
+index f9507b8656..ae23fbf756 100644
+--- a/drivers/gles3/rasterizer_scene_gles3.h
++++ b/drivers/gles3/rasterizer_scene_gles3.h
+@@ -870,7 +870,7 @@ protected:
+ 	void _invalidate_sky(Sky *p_sky);
+ 	void _update_dirty_skys();
+ 	void _update_sky_radiance(RID p_env, const Projection &p_projection, const Transform3D &p_transform, float p_sky_energy_multiplier);
+-	void _draw_sky(RID p_env, const Projection &p_projection, const Transform3D &p_transform, float p_sky_energy_multiplier, float p_luminance_multiplier, bool p_use_multiview, bool p_flip_y, bool p_apply_color_adjustments_in_post);
++	void _draw_sky(RID p_env, const Projection &p_projection, const Transform3D &p_transform, float p_sky_energy_multiplier, bool p_use_multiview, bool p_flip_y);
+ 	void _free_sky_data(Sky *p_sky);
+ 
+ 	// Needed for a single argument calls (material and uv2).
+diff --git a/drivers/gles3/shaders/effects/copy.glsl b/drivers/gles3/shaders/effects/copy.glsl
+index dc6253e780..5156aa970e 100644
+--- a/drivers/gles3/shaders/effects/copy.glsl
++++ b/drivers/gles3/shaders/effects/copy.glsl
+@@ -238,7 +238,7 @@ void main() {
+ 	normal.y = cos(theta);
+ 	normal.z = cos(phi) * sin(theta) * -1.0;
+ 
+-	vec3 color = srgb_to_linear(textureLod(source_cube, normal, mip_level).rgb);
++	vec3 color = textureLod(source_cube, normal, mip_level).rgb;
+ 	frag_color = vec4(color, 1.0);
+ 
+ #endif
+diff --git a/drivers/gles3/shaders/effects/cubemap_filter.glsl b/drivers/gles3/shaders/effects/cubemap_filter.glsl
+index b798e5fa4a..30ef81e1c4 100644
+--- a/drivers/gles3/shaders/effects/cubemap_filter.glsl
++++ b/drivers/gles3/shaders/effects/cubemap_filter.glsl
+@@ -42,7 +42,8 @@ layout(location = 0) out vec4 frag_color;
+ 
+ #define M_PI 3.14159265359
+ 
+-// Don't include tonemap_inc.glsl because all we want is these functions, we don't want the uniforms
++// Note: these helpers are intentionally retained for API/ABI stability even though
++// the radiance/reflection path now filters in linear space without converting.
+ // This approximation expects non-negative input; negative input is undefined behavior.
+ vec3 linear_to_srgb(vec3 color) {
+ 	return max(vec3(1.055) * pow(color, vec3(0.416666667)) - vec3(0.055), vec3(0.0));
+@@ -111,14 +112,11 @@ void main() {
+ 		vec4 sample_direction_mip = sample_directions_mip[sample_num];
+ 		vec3 L = T * sample_direction_mip.xyz;
+ 		vec3 val = textureLod(source_cube, L, sample_direction_mip.w).rgb;
+-		// Mix using linear
+-		val = srgb_to_linear(val);
+ 		sum.rgb += val * sample_direction_mip.z;
+ 	}
+ 
+ 	sum /= weight;
+ 
+-	sum.rgb = linear_to_srgb(sum.rgb);
+ 	frag_color = vec4(sum.rgb, 1.0);
+ #endif
+ }
+diff --git a/drivers/gles3/shaders/effects/glow.glsl b/drivers/gles3/shaders/effects/glow.glsl
+index ca2c524491..931da57773 100644
+--- a/drivers/gles3/shaders/effects/glow.glsl
++++ b/drivers/gles3/shaders/effects/glow.glsl
+@@ -35,7 +35,6 @@ uniform sampler2D source_color; // texunit:0
+ #endif // USE_MULTIVIEW
+ uniform float view;
+ uniform vec2 pixel_size;
+-uniform float luminance_multiplier;
+ uniform float glow_bloom;
+ uniform float glow_hdr_threshold;
+ uniform float glow_hdr_scale;
+@@ -76,14 +75,14 @@ void main() {
+ 	color += textureLod(source_color, uv - vec2(half_pixel.x, -half_pixel.y), 0.0).rgb;
+ 	color += textureLod(source_color, uv + vec2(half_pixel.x, -half_pixel.y), 0.0).rgb;
+ #endif // USE_MULTIVIEW
+-	color /= luminance_multiplier * 8.0;
++	color /= 8.0;
+ 
+ 	float feedback_factor = max(color.r, max(color.g, color.b));
+ 	float feedback = max(smoothstep(glow_hdr_threshold, glow_hdr_threshold + glow_hdr_scale, feedback_factor), glow_bloom);
+ 
+ 	color = min(color * feedback, vec3(glow_luminance_cap));
+ 
+-	frag_color = vec4(luminance_multiplier * color, 1.0);
++	frag_color = vec4(color, 1.0);
+ #endif // MODE_FILTER
+ 
+ #ifdef MODE_DOWNSAMPLE
+diff --git a/drivers/gles3/shaders/effects/post.glsl b/drivers/gles3/shaders/effects/post.glsl
+index 2232b16eb5..be14a549d4 100644
+--- a/drivers/gles3/shaders/effects/post.glsl
++++ b/drivers/gles3/shaders/effects/post.glsl
+@@ -6,7 +6,6 @@ mode_default =
+ 
+ USE_MULTIVIEW = false
+ USE_GLOW = false
+-USE_LUMINANCE_MULTIPLIER = false
+ USE_BCS = false
+ USE_COLOR_CORRECTION = false
+ USE_1D_LUT = false
+@@ -44,7 +43,6 @@ uniform sampler2D source_color; // texunit:0
+ #endif // USE_MULTIVIEW
+ 
+ uniform float view;
+-uniform float luminance_multiplier;
+ 
+ #ifdef USE_GLOW
+ uniform sampler2D glow_color; // texunit:1
+@@ -64,10 +62,6 @@ vec4 get_glow_color(vec2 uv) {
+ 	color += textureLod(glow_color, uv + vec2(0.0, -half_pixel.y * 2.0), 0.0);
+ 	color += textureLod(glow_color, uv + vec2(-half_pixel.x, -half_pixel.y), 0.0) * 2.0;
+ 
+-#ifdef USE_LUMINANCE_MULTIPLIER
+-	color = color / luminance_multiplier;
+-#endif
+-
+ 	return color / 12.0;
+ }
+ #endif // USE_GLOW
+@@ -125,15 +119,12 @@ void main() {
+ 	vec4 color = texture(source_color, uv_interp);
+ #endif
+ 
+-#ifdef USE_LUMINANCE_MULTIPLIER
+-	color = color / luminance_multiplier;
+-#endif
++	// The source is linear HDR, apply exposure before any other processing.
++	color.rgb *= exposure;
+ 
+ #ifdef USE_GLOW
+-	// Glow blending is performed before srgb_to_linear because
+-	// the glow texture was created from a nonlinear sRGB-encoded
+-	// scene, so it only makes sense to add this glow to an equally
+-	// nonlinear sRGB-encoded scene.
++	// Glow blending is performed in linear space so it matches the scene shader,
++	// which now outputs linear HDR color.
+ 
+ 	vec4 glow = get_glow_color(uv_interp) * glow_intensity;
+ 
+@@ -146,21 +137,11 @@ void main() {
+ 	// Note: srgb_white cannot be smaller than the maximum output value (1.0).
+ 	glow.rgb = clamp(glow.rgb, 0.0, srgb_white);
+ 
+-	// Normalize to srgb_white range.
+-	//glow.rgb /= srgb_white;
+-	//color.rgb /= srgb_white;
+-	//color.rgb = (color.rgb + glow.rgb) - (color.rgb * glow.rgb);
+-	// Expand back to original range.
+-	//color.rgb *= srgb_white;
+-
+-	// The following is a mathematically simplified version of the above.
++	// The following is a mathematically simplified screen blend.
+ 	color.rgb = color.rgb + glow.rgb - (color.rgb * glow.rgb / srgb_white);
+ #endif // USE_GLOW
+ 
+-	color.rgb = srgb_to_linear(color.rgb);
+-
+ #if defined(USE_SOME_SSAO)
+-	// Putting SSAO after the conversion to linear color, though it might be better before the glow.
+ 	color.rgb *= s4ao(uv_interp); // The USE_SSAO_X controls the number of samples.
+ #endif
+ 
+diff --git a/drivers/gles3/shaders/scene.glsl b/drivers/gles3/shaders/scene.glsl
+index c2d544c1a2..b48ea0fdfd 100644
+--- a/drivers/gles3/shaders/scene.glsl
++++ b/drivers/gles3/shaders/scene.glsl
+@@ -33,7 +33,6 @@ LIGHT_USE_PSSM4 = false
+ LIGHT_USE_PSSM_BLEND = false
+ BASE_PASS = true
+ USE_ADDITIVE_LIGHTING = false
+-APPLY_TONEMAPPING = true
+ // We can only use one type of light per additive pass. This means that if USE_ADDITIVE_LIGHTING is defined, and
+ // these are false, we are doing a directional light pass.
+ ADDITIVE_OMNI = false
+@@ -2120,7 +2119,7 @@ void reflection_process(samplerCube reflection_map,
+ 		ref_normal = posonbox - box_offset.xyz;
+ 	}
+ 
+-	reflection.rgb = srgb_to_linear(textureLod(reflection_map, ref_normal, roughness * MAX_ROUGHNESS_LOD).rgb);
++	reflection.rgb = textureLod(reflection_map, ref_normal, roughness * MAX_ROUGHNESS_LOD).rgb;
+ 
+ 	if (exterior) {
+ 		reflection.rgb = mix(skybox, reflection.rgb, blend);
+@@ -2136,7 +2135,7 @@ void reflection_process(samplerCube reflection_map,
+ 		vec4 ambient_out;
+ 		vec3 amb_normal = (local_matrix * vec4(normal, 0.0)).xyz;
+ 
+-		ambient_out.rgb = srgb_to_linear(textureLod(reflection_map, amb_normal, MAX_ROUGHNESS_LOD).rgb);
++		ambient_out.rgb = textureLod(reflection_map, amb_normal, MAX_ROUGHNESS_LOD).rgb;
+ 		if (exterior) {
+ 			ambient_out.rgb = mix(ambient, ambient_out.rgb, blend);
+ 		}
+@@ -2553,7 +2552,6 @@ void main() {
+ 		float horizon = min(1.0 + dot(ref_vec, indirect_normal), 1.0);
+ 		ref_vec = mat3(scene_data_block.data.radiance_inverse_xform) * ref_vec;
+ 		specular_light = textureLod(radiance_map, ref_vec, sqrt(roughness) * RADIANCE_MAX_LOD).rgb;
+-		specular_light = srgb_to_linear(specular_light);
+ 		specular_light *= horizon * horizon;
+ 		specular_light *= scene_data_block.data.ambient_light_color_energy.a;
+ 	}
+@@ -2598,7 +2596,6 @@ void main() {
+ 		if (scene_data_block.data.use_ambient_cubemap) {
+ 			vec3 ambient_dir = mat3(scene_data_block.data.radiance_inverse_xform) * indirect_normal;
+ 			vec3 cubemap_ambient = textureLod(radiance_map, ambient_dir, RADIANCE_MAX_LOD).rgb;
+-			cubemap_ambient = srgb_to_linear(cubemap_ambient);
+ 			ambient_light = mix(ambient_light, cubemap_ambient * scene_data_block.data.ambient_light_color_energy.a, scene_data_block.data.ambient_color_sky_mix);
+ 		}
+ #endif // USE_RADIANCE_MAP
+@@ -2968,13 +2965,6 @@ void main() {
+ 	frag_color.rgb = mix(frag_color.rgb, fog.rgb, fog.a);
+ #endif // !FOG_DISABLED
+ 
+-	// Tonemap before writing as we are writing to an sRGB framebuffer
+-	frag_color.rgb *= exposure;
+-#ifdef APPLY_TONEMAPPING
+-	frag_color.rgb = apply_tonemapping(frag_color.rgb);
+-#endif
+-	frag_color.rgb = linear_to_srgb(frag_color.rgb);
+-
+ #else // !BASE_PASS
+ 	frag_color = vec4(0.0, 0.0, 0.0, alpha);
+ #endif // !BASE_PASS
+@@ -3242,16 +3232,8 @@ void main() {
+ 	additive_light_color *= (1.0 - fog.a);
+ #endif // !FOG_DISABLED
+ 
+-	// Tonemap before writing as we are writing to an sRGB framebuffer
+-	additive_light_color *= exposure;
+-#ifdef APPLY_TONEMAPPING
+-	additive_light_color = apply_tonemapping(additive_light_color);
+-#endif
+-	additive_light_color = linear_to_srgb(additive_light_color);
+-
+ 	frag_color.rgb += additive_light_color;
+ #endif // USE_ADDITIVE_LIGHTING
+-	frag_color.rgb *= scene_data_block.data.luminance_multiplier;
+ 
+ #endif // !RENDER_MATERIAL
+ #endif // !MODE_RENDER_DEPTH
+diff --git a/drivers/gles3/shaders/sky.glsl b/drivers/gles3/shaders/sky.glsl
+index bf5bb4f5d8..e0485248e4 100644
+--- a/drivers/gles3/shaders/sky.glsl
++++ b/drivers/gles3/shaders/sky.glsl
+@@ -8,7 +8,6 @@ mode_cubemap = #define USE_CUBEMAP_PASS
+ 
+ USE_MULTIVIEW = false
+ USE_INVERTED_Y = true
+-APPLY_TONEMAPPING = true
+ USE_QUARTER_RES_PASS = false
+ USE_HALF_RES_PASS = false
+ 
+@@ -78,7 +77,6 @@ uniform vec4 projection;
+ uniform vec3 position;
+ uniform float time;
+ uniform float sky_energy_multiplier;
+-uniform float luminance_multiplier;
+ 
+ uniform float fog_aerial_perspective;
+ uniform vec4 fog_light_color;
+@@ -263,16 +261,10 @@ void main() {
+ 
+ #endif // DISABLE_FOG
+ 
+-	color *= exposure;
+-#ifdef APPLY_TONEMAPPING
+-	color = apply_tonemapping(color);
+-#endif
+-	color = linear_to_srgb(color);
+-
+-	frag_color.rgb = color * luminance_multiplier;
++	frag_color.rgb = color;
+ 	frag_color.a = alpha;
+ 
+ #ifdef USE_DEBANDING
+-	frag_color.rgb += interleaved_gradient_noise(gl_FragCoord.xy) * sky_energy_multiplier * luminance_multiplier;
++	frag_color.rgb += interleaved_gradient_noise(gl_FragCoord.xy) * sky_energy_multiplier;
+ #endif
+ }
+diff --git a/drivers/gles3/shaders/tonemap_inc.glsl b/drivers/gles3/shaders/tonemap_inc.glsl
+index eb160a1f17..1388bff011 100644
+--- a/drivers/gles3/shaders/tonemap_inc.glsl
++++ b/drivers/gles3/shaders/tonemap_inc.glsl
+@@ -12,16 +12,14 @@ layout(std140) uniform TonemapData { //ubo:0
+ 
+ // This approximation expects non-negative input; negative input is undefined behavior.
+ vec3 linear_to_srgb(vec3 color) {
+-	//const vec3 a = vec3(0.055f);
+-	//return mix((vec3(1.0f) + a) * pow(color.rgb, vec3(1.0f / 2.4f)) - a, 12.92f * color.rgb, lessThan(color.rgb, vec3(0.0031308f)));
+-	// Approximation from http://chilliant.blogspot.com/2012/08/srgb-approximations-for-hlsl.html
+-	return max(vec3(1.055) * pow(color, vec3(0.416666667)) - vec3(0.055), vec3(0.0));
++	const vec3 a = vec3(0.055f);
++	return mix((vec3(1.0f) + a) * pow(color.rgb, vec3(1.0f / 2.4f)) - a, 12.92f * color.rgb, lessThan(color.rgb, vec3(0.0031308f)));
+ }
+ 
+ // This approximation expects non-negative input; negative input behaves poorly.
+ vec3 srgb_to_linear(vec3 color) {
+-	// Approximation from http://chilliant.blogspot.com/2012/08/srgb-approximations-for-hlsl.html
+-	return color * (color * (color * 0.305306011 + 0.682171111) + 0.012522878);
++	const vec3 a = vec3(0.055f);
++	return mix(pow((color.rgb + a) * (1.0f / (vec3(1.0f) + a)), vec3(2.4f)), color.rgb * (1.0f / 12.92f), lessThan(color.rgb, vec3(0.04045f)));
+ }
+ 
+ #ifdef APPLY_TONEMAPPING
+diff --git a/drivers/gles3/storage/config.cpp b/drivers/gles3/storage/config.cpp
+index c830857524..6afef3899a 100644
+--- a/drivers/gles3/storage/config.cpp
++++ b/drivers/gles3/storage/config.cpp
+@@ -34,6 +34,7 @@
+ 
+ #include "core/config/project_settings.h"
+ #include "core/os/os.h"
++#include "core/string/print_string.h"
+ #include "core/string/ustring.h"
+ #include "drivers/gles3/rasterizer_util_gles3.h"
+ 
+@@ -93,6 +94,8 @@ Config::Config() {
+ 	if (RasterizerUtilGLES3::is_gles_over_gl()) {
+ 		float_texture_supported = true;
+ 		float_texture_linear_supported = true;
++		half_float_render_target_supported = true;
++		float_blend_supported = true;
+ 		etc2_supported = false;
+ 		s3tc_supported = true;
+ 		rgtc_supported = true; //RGTC - core since OpenGL version 3.0
+@@ -101,6 +104,8 @@ Config::Config() {
+ 	} else {
+ 		float_texture_supported = extensions.has("GL_EXT_color_buffer_float");
+ 		float_texture_linear_supported = extensions.has("GL_OES_texture_float_linear");
++		half_float_render_target_supported = extensions.has("GL_EXT_color_buffer_half_float");
++		float_blend_supported = extensions.has("GL_EXT_float_blend");
+ 		etc2_supported = true;
+ #if defined(ANDROID_ENABLED) || defined(IOS_ENABLED)
+ 		// Some Android devices report support for S3TC but we don't expect that and don't export the textures.
+@@ -115,6 +120,20 @@ Config::Config() {
+ 		unorm16_texture_supported = extensions.has("GL_EXT_texture_norm16");
+ 	}
+ 
++	// HDR rendering requires both a float-capable color render target and support for
++	// blending into it (transparent objects, additive lighting and glow all need this).
++	hdr_render_supported = (float_texture_supported || half_float_render_target_supported) && float_blend_supported;
++
++	print_line(vformat("GLES3 HDR: color_buffer_float=%s color_buffer_half_float=%s float_blend=%s => hdr_render=%s",
++			float_texture_supported ? "YES" : "no",
++			half_float_render_target_supported ? "YES" : "no",
++			float_blend_supported ? "YES" : "no",
++			hdr_render_supported ? "YES" : "no"));
++	print_line(vformat("GLES3 ext (raw): cbf=%s cbhf=%s fb=%s",
++			extensions.has("GL_EXT_color_buffer_float") ? "Y" : "N",
++			extensions.has("GL_EXT_color_buffer_half_float") ? "Y" : "N",
++			extensions.has("GL_EXT_float_blend") ? "Y" : "N"));
++
+ 	glGetIntegerv(GL_MAX_VERTEX_TEXTURE_IMAGE_UNITS, &max_vertex_texture_image_units);
+ 	glGetIntegerv(GL_MAX_TEXTURE_IMAGE_UNITS, &max_texture_image_units);
+ 	glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max_texture_size);
+diff --git a/drivers/gles3/storage/config.h b/drivers/gles3/storage/config.h
+index 3dd9ce1e9d..4214489882 100644
+--- a/drivers/gles3/storage/config.h
++++ b/drivers/gles3/storage/config.h
+@@ -76,6 +76,9 @@ public:
+ 
+ 	bool float_texture_supported = false;
+ 	bool float_texture_linear_supported = false;
++	bool half_float_render_target_supported = false;
++	bool float_blend_supported = false;
++	bool hdr_render_supported = false;
+ 	bool s3tc_supported = false;
+ 	bool rgtc_supported = false;
+ 	bool bptc_supported = false;
+diff --git a/drivers/gles3/storage/light_storage.cpp b/drivers/gles3/storage/light_storage.cpp
+index 86b7b6719b..a137426b04 100644
+--- a/drivers/gles3/storage/light_storage.cpp
++++ b/drivers/gles3/storage/light_storage.cpp
+@@ -38,6 +38,7 @@
+ #include "drivers/gles3/effects/cubemap_filter.h"
+ #include "drivers/gles3/rasterizer_scene_gles3.h"
+ #include "drivers/gles3/rasterizer_util_gles3.h"
++#include "drivers/gles3/storage/config.h"
+ #include "drivers/gles3/storage/render_scene_buffers_gles3.h"
+ #include "drivers/gles3/storage/utilities.h"
+ 
+@@ -887,6 +888,13 @@ bool LightStorage::reflection_probe_instance_begin_render(RID p_instance, RID p_
+ 		atlas->mipmap_count = Image::get_image_required_mipmaps(atlas->size, atlas->size, Image::FORMAT_RGBAH) - 1;
+ 		atlas->mipmap_count = MIN(atlas->mipmap_count, 8); // No more than 8 please..
+ 
++		// Use HDR half-float storage when supported so reflection probes preserve
++		// values above 1.0 like the Forward+ renderer. Fall back to RGB10_A2.
++		const bool use_hdr = Config::get_singleton()->hdr_render_supported;
++		const GLenum reflection_format = use_hdr ? GL_RGBA16F : GL_RGB10_A2;
++		const GLenum reflection_type = use_hdr ? GL_HALF_FLOAT : GL_UNSIGNED_INT_2_10_10_10_REV;
++		const uint32_t bytes_per_pixel = use_hdr ? 8 : 4;
++
+ 		glActiveTexture(GL_TEXTURE0);
+ 
+ 		{
+@@ -912,14 +920,14 @@ bool LightStorage::reflection_probe_instance_begin_render(RID p_instance, RID p_
+ #ifdef GL_API_ENABLED
+ 			if (RasterizerUtilGLES3::is_gles_over_gl()) {
+ 				for (int s = 0; s < 6; s++) {
+-					glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + s, 0, GL_RGB10_A2, atlas->size, atlas->size, 0, GL_RGBA, GL_UNSIGNED_INT_2_10_10_10_REV, nullptr);
++					glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + s, 0, reflection_format, atlas->size, atlas->size, 0, GL_RGBA, reflection_type, nullptr);
+ 				}
+ 				glGenerateMipmap(GL_TEXTURE_CUBE_MAP);
+ 			}
+ #endif
+ #ifdef GLES_API_ENABLED
+ 			if (!RasterizerUtilGLES3::is_gles_over_gl()) {
+-				glTexStorage2D(GL_TEXTURE_CUBE_MAP, atlas->mipmap_count, GL_RGB10_A2, atlas->size, atlas->size);
++				glTexStorage2D(GL_TEXTURE_CUBE_MAP, atlas->mipmap_count, reflection_format, atlas->size, atlas->size);
+ 			}
+ #endif // GLES_API_ENABLED
+ 
+@@ -935,7 +943,7 @@ bool LightStorage::reflection_probe_instance_begin_render(RID p_instance, RID p_
+ 			uint32_t data_size = 0;
+ 			for (int m = 0; m < atlas->mipmap_count; m++) {
+ 				atlas->mipmap_size[m] = mipmap_size;
+-				data_size += mipmap_size * mipmap_size * 6 * 4;
++				data_size += mipmap_size * mipmap_size * 6 * bytes_per_pixel;
+ 				mipmap_size = MAX(mipmap_size >> 1, 1);
+ 			}
+ 
+@@ -950,14 +958,14 @@ bool LightStorage::reflection_probe_instance_begin_render(RID p_instance, RID p_
+ #ifdef GL_API_ENABLED
+ 			if (RasterizerUtilGLES3::is_gles_over_gl()) {
+ 				for (int s = 0; s < 6; s++) {
+-					glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + s, 0, GL_RGB10_A2, atlas->size, atlas->size, 0, GL_RGBA, GL_UNSIGNED_INT_2_10_10_10_REV, nullptr);
++					glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + s, 0, reflection_format, atlas->size, atlas->size, 0, GL_RGBA, reflection_type, nullptr);
+ 				}
+ 				glGenerateMipmap(GL_TEXTURE_CUBE_MAP);
+ 			}
+ #endif
+ #ifdef GLES_API_ENABLED
+ 			if (!RasterizerUtilGLES3::is_gles_over_gl()) {
+-				glTexStorage2D(GL_TEXTURE_CUBE_MAP, atlas->mipmap_count, GL_RGB10_A2, atlas->size, atlas->size);
++				glTexStorage2D(GL_TEXTURE_CUBE_MAP, atlas->mipmap_count, reflection_format, atlas->size, atlas->size);
+ 			}
+ #endif // GLES_API_ENABLED
+ 
+diff --git a/drivers/gles3/storage/render_scene_buffers_gles3.cpp b/drivers/gles3/storage/render_scene_buffers_gles3.cpp
+index 296206ae1a..04aedeec83 100644
+--- a/drivers/gles3/storage/render_scene_buffers_gles3.cpp
++++ b/drivers/gles3/storage/render_scene_buffers_gles3.cpp
+@@ -32,6 +32,7 @@
+ 
+ #ifdef GLES3_ENABLED
+ 
++#include "core/string/print_string.h"
+ #include "drivers/gles3/storage/config.h"
+ #include "drivers/gles3/storage/texture_storage.h"
+ #include "drivers/gles3/storage/utilities.h"
+@@ -155,6 +156,17 @@ void RenderSceneBuffersGLES3::configure(const RenderSceneBuffersConfiguration *p
+ 		color_format_size = 4;
+ 	}
+ 
++	// Our intermediate buffers render in linear HDR space. When the device supports
++	// rendering to half-float buffers, use them so the scene shader can output unbounded
++	// linear values. Otherwise fall back to the closest LDR format while keeping the
++	// exact same linear pipeline.
++	if (config->hdr_render_supported) {
++		color_internal_format = GL_RGBA16F;
++		color_format = GL_RGBA;
++		color_type = GL_HALF_FLOAT;
++		color_format_size = 8;
++	}
++
+ 	// Check our scaling mode
+ 	if (scaling_3d_mode != RSE::VIEWPORT_SCALING_3D_MODE_OFF && internal_size.x == 0 && internal_size.y == 0) {
+ 		// Disable, no size set.
+@@ -181,6 +193,12 @@ void RenderSceneBuffersGLES3::configure(const RenderSceneBuffersConfiguration *p
+ 	}
+ 
+ 	// We don't create our buffers right away because post effects can be made active at any time and change our buffer configuration.
++
++	static bool logged_rsb_format = false;
++	if (!logged_rsb_format) {
++		logged_rsb_format = true;
++		print_line(vformat("RSB format: %s (internal 0x%04x)", config->hdr_render_supported ? "RGBA16F" : "RGB10_A2/RGBA8", color_internal_format));
++	}
+ }
+ 
+ void RenderSceneBuffersGLES3::_check_render_buffers() {
+@@ -189,7 +207,7 @@ void RenderSceneBuffersGLES3::_check_render_buffers() {
+ 
+ 	ERR_FAIL_COND(view_count == 0);
+ 
+-	bool use_internal_buffer = scaling_3d_mode != RSE::VIEWPORT_SCALING_3D_MODE_OFF || apply_environment_effects_in_post || apply_canvas_bg_exposure;
++	bool use_internal_buffer = true;
+ 	GLenum depth_format = GL_DEPTH24_STENCIL8;
+ 	uint32_t depth_format_size = 4;
+ 	bool use_multiview = view_count > 1;
+@@ -559,14 +577,6 @@ void RenderSceneBuffersGLES3::_clear_back_buffers() {
+ 	}
+ }
+ 
+-void RenderSceneBuffersGLES3::set_apply_environment_effects_in_post(bool p_apply_in_post) {
+-	apply_environment_effects_in_post = p_apply_in_post;
+-}
+-
+-void RenderSceneBuffersGLES3::set_apply_canvas_bg_exposure(bool p_apply_canvas_bg_exposure) {
+-	apply_canvas_bg_exposure = p_apply_canvas_bg_exposure;
+-}
+-
+ void RenderSceneBuffersGLES3::check_glow_buffers() {
+ 	if (glow.levels[0].color != 0) {
+ 		// already have these setup..
+diff --git a/drivers/gles3/storage/render_scene_buffers_gles3.h b/drivers/gles3/storage/render_scene_buffers_gles3.h
+index 497c5d3e91..283491220a 100644
+--- a/drivers/gles3/storage/render_scene_buffers_gles3.h
++++ b/drivers/gles3/storage/render_scene_buffers_gles3.h
+@@ -49,8 +49,6 @@ public:
+ 	//bool use_taa = false;
+ 	//bool use_debanding = false;
+ 	uint32_t view_count = 1;
+-	bool apply_environment_effects_in_post = false;
+-	bool apply_canvas_bg_exposure = false;
+ 
+ 	RID render_target;
+ 
+@@ -107,8 +105,6 @@ public:
+ 	virtual void set_fsr_sharpness(float p_fsr_sharpness) override {}
+ 	virtual void set_texture_mipmap_bias(float p_texture_mipmap_bias) override {}
+ 	virtual void set_use_debanding(bool p_use_debanding) override {}
+-	void set_apply_environment_effects_in_post(bool p_apply_environment_effects_in_post);
+-	void set_apply_canvas_bg_exposure(bool p_apply_canvas_bg_exposure);
+ 
+ 	void free_render_buffer_data();
+ 
+diff --git a/platform/web/display_server_web.cpp b/platform/web/display_server_web.cpp
+index 496bf89826..7cbc46ba91 100644
+--- a/platform/web/display_server_web.cpp
++++ b/platform/web/display_server_web.cpp
+@@ -1148,6 +1148,12 @@ DisplayServerWeb::DisplayServerWeb(const String &p_rendering_driver, DisplayServ
+ 		if (!emscripten_webgl_enable_extension(webgl_ctx, "OVR_multiview2")) {
+ 			print_verbose("Failed to enable WebXR extension.");
+ 		}
++		// Enable float render target extensions so the Compatibility renderer can
++		// render to linear HDR (half-float) color buffers. These are optional, the
++		// renderer falls back to an LDR pipeline when they are unavailable.
++		emscripten_webgl_enable_extension(webgl_ctx, "EXT_color_buffer_half_float");
++		emscripten_webgl_enable_extension(webgl_ctx, "EXT_color_buffer_float");
++		emscripten_webgl_enable_extension(webgl_ctx, "EXT_float_blend");
+ 		RasterizerGLES3::make_current(false);
+ 
+ 	} else {

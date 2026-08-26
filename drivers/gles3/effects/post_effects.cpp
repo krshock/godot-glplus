@@ -91,7 +91,7 @@ void PostEffects::_draw_screen_triangle() {
 void PostEffects::post_copy(
 		GLuint p_dest_framebuffer, Size2i p_dest_size, GLuint p_source_color,
 		GLuint p_source_depth, bool p_ssao_enabled, int p_ssao_quality_level, float p_ssao_strength, float p_ssao_radius,
-		Size2i p_source_size, float p_luminance_multiplier, const Glow::Level *p_glow_buffers, float p_glow_intensity,
+		Size2i p_source_size, const Glow::Level *p_glow_buffers, float p_glow_intensity,
 		float p_srgb_white, uint32_t p_view, bool p_use_multiview, uint64_t p_spec_constants, bool p_bilinear_filtering) {
 	glDisable(GL_DEPTH_TEST);
 	glDepthMask(GL_FALSE);
@@ -120,9 +120,6 @@ void PostEffects::post_copy(
 		} else {
 			flags |= PostShaderGLES3::USE_SSAO_MED;
 		}
-	}
-	if (p_luminance_multiplier != 1.0) {
-		flags |= PostShaderGLES3::USE_LUMINANCE_MULTIPLIER;
 	}
 
 	bool success = post.shader.version_bind_shader(post.shader_version, mode, flags);
@@ -161,7 +158,6 @@ void PostEffects::post_copy(
 	}
 
 	post.shader.version_set_uniform(PostShaderGLES3::VIEW, float(p_view), post.shader_version, mode, flags);
-	post.shader.version_set_uniform(PostShaderGLES3::LUMINANCE_MULTIPLIER, p_luminance_multiplier, post.shader_version, mode, flags);
 
 	_draw_screen_triangle();
 

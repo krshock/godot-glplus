@@ -32,6 +32,7 @@
 
 #ifdef GLES3_ENABLED
 
+#include "core/string/print_string.h"
 #include "drivers/gles3/storage/config.h"
 #include "drivers/gles3/storage/texture_storage.h"
 #include "drivers/gles3/storage/utilities.h"
@@ -155,6 +156,17 @@ void RenderSceneBuffersGLES3::configure(const RenderSceneBuffersConfiguration *p
 		color_format_size = 4;
 	}
 
+	// Our intermediate buffers render in linear HDR space. When the device supports
+	// rendering to half-float buffers, use them so the scene shader can output unbounded
+	// linear values. Otherwise fall back to the closest LDR format while keeping the
+	// exact same linear pipeline.
+	if (config->hdr_render_supported) {
+		color_internal_format = GL_RGBA16F;
+		color_format = GL_RGBA;
+		color_type = GL_HALF_FLOAT;
+		color_format_size = 8;
+	}
+
 	// Check our scaling mode
 	if (scaling_3d_mode != RSE::VIEWPORT_SCALING_3D_MODE_OFF && internal_size.x == 0 && internal_size.y == 0) {
 		// Disable, no size set.
@@ -181,6 +193,12 @@ void RenderSceneBuffersGLES3::configure(const RenderSceneBuffersConfiguration *p
 	}
 
 	// We don't create our buffers right away because post effects can be made active at any time and change our buffer configuration.
+
+	static bool logged_rsb_format = false;
+	if (!logged_rsb_format) {
+		logged_rsb_format = true;
+		print_line(vformat("RSB format: %s (internal 0x%04x)", config->hdr_render_supported ? "RGBA16F" : "RGB10_A2/RGBA8", color_internal_format));
+	}
 }
 
 void RenderSceneBuffersGLES3::_check_render_buffers() {
@@ -189,7 +207,7 @@ void RenderSceneBuffersGLES3::_check_render_buffers() {
 
 	ERR_FAIL_COND(view_count == 0);
 
-	bool use_internal_buffer = scaling_3d_mode != RSE::VIEWPORT_SCALING_3D_MODE_OFF || apply_environment_effects_in_post || apply_canvas_bg_exposure;
+	bool use_internal_buffer = true;
 	GLenum depth_format = GL_DEPTH24_STENCIL8;
 	uint32_t depth_format_size = 4;
 	bool use_multiview = view_count > 1;
@@ -557,14 +575,6 @@ void RenderSceneBuffersGLES3::_clear_back_buffers() {
 		GLES3::Utilities::get_singleton()->texture_free_data(backbuffer3d.depth);
 		backbuffer3d.depth = 0;
 	}
-}
-
-void RenderSceneBuffersGLES3::set_apply_environment_effects_in_post(bool p_apply_in_post) {
-	apply_environment_effects_in_post = p_apply_in_post;
-}
-
-void RenderSceneBuffersGLES3::set_apply_canvas_bg_exposure(bool p_apply_canvas_bg_exposure) {
-	apply_canvas_bg_exposure = p_apply_canvas_bg_exposure;
 }
 
 void RenderSceneBuffersGLES3::check_glow_buffers() {

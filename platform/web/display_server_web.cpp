@@ -1148,6 +1148,12 @@ DisplayServerWeb::DisplayServerWeb(const String &p_rendering_driver, DisplayServ
 		if (!emscripten_webgl_enable_extension(webgl_ctx, "OVR_multiview2")) {
 			print_verbose("Failed to enable WebXR extension.");
 		}
+		// Enable float render target extensions so the Compatibility renderer can
+		// render to linear HDR (half-float) color buffers. These are optional, the
+		// renderer falls back to an LDR pipeline when they are unavailable.
+		emscripten_webgl_enable_extension(webgl_ctx, "EXT_color_buffer_half_float");
+		emscripten_webgl_enable_extension(webgl_ctx, "EXT_color_buffer_float");
+		emscripten_webgl_enable_extension(webgl_ctx, "EXT_float_blend");
 		RasterizerGLES3::make_current(false);
 
 	} else {

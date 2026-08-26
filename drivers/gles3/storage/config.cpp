@@ -34,6 +34,7 @@
 
 #include "core/config/project_settings.h"
 #include "core/os/os.h"
+#include "core/string/print_string.h"
 #include "core/string/ustring.h"
 #include "drivers/gles3/rasterizer_util_gles3.h"
 
@@ -93,6 +94,8 @@ Config::Config() {
 	if (RasterizerUtilGLES3::is_gles_over_gl()) {
 		float_texture_supported = true;
 		float_texture_linear_supported = true;
+		half_float_render_target_supported = true;
+		float_blend_supported = true;
 		etc2_supported = false;
 		s3tc_supported = true;
 		rgtc_supported = true; //RGTC - core since OpenGL version 3.0
@@ -101,6 +104,8 @@ Config::Config() {
 	} else {
 		float_texture_supported = extensions.has("GL_EXT_color_buffer_float");
 		float_texture_linear_supported = extensions.has("GL_OES_texture_float_linear");
+		half_float_render_target_supported = extensions.has("GL_EXT_color_buffer_half_float");
+		float_blend_supported = extensions.has("GL_EXT_float_blend");
 		etc2_supported = true;
 #if defined(ANDROID_ENABLED) || defined(IOS_ENABLED)
 		// Some Android devices report support for S3TC but we don't expect that and don't export the textures.
@@ -114,6 +119,20 @@ Config::Config() {
 		srgb_framebuffer_supported = extensions.has("GL_EXT_sRGB_write_control");
 		unorm16_texture_supported = extensions.has("GL_EXT_texture_norm16");
 	}
+
+	// HDR rendering requires both a float-capable color render target and support for
+	// blending into it (transparent objects, additive lighting and glow all need this).
+	hdr_render_supported = (float_texture_supported || half_float_render_target_supported) && float_blend_supported;
+
+	print_line(vformat("GLES3 HDR: color_buffer_float=%s color_buffer_half_float=%s float_blend=%s => hdr_render=%s",
+			float_texture_supported ? "YES" : "no",
+			half_float_render_target_supported ? "YES" : "no",
+			float_blend_supported ? "YES" : "no",
+			hdr_render_supported ? "YES" : "no"));
+	print_line(vformat("GLES3 ext (raw): cbf=%s cbhf=%s fb=%s",
+			extensions.has("GL_EXT_color_buffer_float") ? "Y" : "N",
+			extensions.has("GL_EXT_color_buffer_half_float") ? "Y" : "N",
+			extensions.has("GL_EXT_float_blend") ? "Y" : "N"));
 
 	glGetIntegerv(GL_MAX_VERTEX_TEXTURE_IMAGE_UNITS, &max_vertex_texture_image_units);
 	glGetIntegerv(GL_MAX_TEXTURE_IMAGE_UNITS, &max_texture_image_units);
