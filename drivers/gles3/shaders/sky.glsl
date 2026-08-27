@@ -244,9 +244,6 @@ void main() {
 
 	color *= sky_energy_multiplier;
 
-	// Convert to Linear for tonemapping so color matches scene shader better
-	color = srgb_to_linear(color);
-
 #if !defined(DISABLE_FOG) && !defined(USE_CUBEMAP_PASS)
 
 	// Draw "fixed" fog before volumetric fog to ensure volumetric fog can appear in front of the sky.

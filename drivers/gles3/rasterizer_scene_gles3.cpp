@@ -1041,6 +1041,13 @@ void RasterizerSceneGLES3::_update_sky_radiance(RID p_env, const Projection &p_p
 		sky->processing_layer = 1;
 		sky->baked_exposure = p_sky_energy_multiplier;
 		sky->reflection_dirty = false;
+
+		static bool logged_sky_bake = false;
+		if (!logged_sky_bake) {
+			logged_sky_bake = true;
+			Variant exp = material_storage->material_get_param(sky_material, "exposure");
+			print_line(vformat("SKY BAKE: sky_energy_multiplier=%f baked_exposure=%f material_exposure_param=%s", p_sky_energy_multiplier, sky->baked_exposure, String(exp)));
+		}
 	} else {
 		if (sky_mode == RSE::SKY_MODE_INCREMENTAL && sky->processing_layer < max_processing_layer) {
 			scene_state.reset_gl_state();
@@ -1639,6 +1646,15 @@ void RasterizerSceneGLES3::_setup_environment(const RenderDataGLES3 *p_render_da
 			scene_state.data.use_reflection_cubemap = false;
 		}
 
+		static bool logged_amb = false;
+		if (!logged_amb) {
+			logged_amb = true;
+			print_line(vformat("AMBIENT SETUP: ambient_src=%d env_bg=%d sky_mix=%f bg_energy=%f use_ambient_light=%d use_ambient_cubemap=%d use_reflection_cubemap=%d ambient_color_energy=(%f,%f,%f,%f)",
+					(int)ambient_src, (int)env_bg, scene_state.data.ambient_color_sky_mix, bg_energy_multiplier,
+					(int)scene_state.data.use_ambient_light, (int)scene_state.data.use_ambient_cubemap, (int)scene_state.data.use_reflection_cubemap,
+					scene_state.data.ambient_light_color_energy[0], scene_state.data.ambient_light_color_energy[1], scene_state.data.ambient_light_color_energy[2], scene_state.data.ambient_light_color_energy[3]));
+		}
+
 		scene_state.data.fog_enabled = environment_get_fog_enabled(p_render_data->environment);
 		scene_state.data.fog_mode = environment_get_fog_mode(p_render_data->environment);
 		scene_state.data.fog_density = environment_get_fog_density(p_render_data->environment);
@@ -1669,6 +1685,12 @@ void RasterizerSceneGLES3::_setup_environment(const RenderDataGLES3 *p_render_da
 			if (sky_rid.is_valid()) {
 				float current_exposure = RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_render_data->camera_attributes) * environment_get_bg_intensity(p_render_data->environment);
 				scene_state.data.IBL_exposure_normalization = current_exposure / MAX(0.001, sky_get_baked_exposure(sky_rid));
+
+				static int logged_ibl = 0;
+				if (logged_ibl < 2) {
+					logged_ibl++;
+					print_line(vformat("IBL NORM: current_exposure=%f baked_exposure=%f => IBL_exposure_normalization=%f", current_exposure, sky_get_baked_exposure(sky_rid), scene_state.data.IBL_exposure_normalization));
+				}
 			}
 		}
 	} else if (scene_state.data.emissive_exposure_normalization > 0.0) {
@@ -4682,7 +4704,7 @@ void sky() {
 
 shader_type sky;
 
-uniform vec4 clear_color;
+uniform vec4 clear_color : source_color;
 
 void sky() {
 	COLOR = clear_color.rgb;

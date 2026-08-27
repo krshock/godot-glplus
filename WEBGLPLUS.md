@@ -1,5 +1,39 @@
 # WEBGLPLUS — Linear HDR shading in the Compatibility (GLES3 / WebGL2) renderer
 
+## Summary
+
+This project makes the OpenGL (Compatibility / GLES3 / WebGL2) renderer shade
+the way the **Forward+ (Vulkan) renderer does, with Forward+ as the ground
+truth**: the goal is to **minimize lighting differences between the two
+renderers**, so the same scene looks the same on GL and Vulkan.
+
+This change turns Godot's Compatibility renderer into a **linear HDR pipeline
+that matches Forward+**, while keeping full binary/API compatibility with
+Godot's scripting and extension API.
+
+Current capabilities (verified against Forward+ on native and WebGL2 on Chrome):
+
+- **HDR intermediate buffer** — the 3D scene renders to `GL_RGBA16F` (or
+  `RGB10_A2`/`RGBA8` fallback) instead of an 8-bit sRGB buffer; values above 1.0
+  survive until tonemapping.
+- **Linear lighting end-to-end** — the scene shader lights in linear space and
+  writes raw linear color; exposure + tonemap + sRGB conversion happen **once**,
+  in `post.glsl`.
+- **Correct sky color space** — sky-material `source_color` uniforms are
+  converted sRGB→linear at upload (like Forward+), so sky, sky ambient, and
+  reflections match Forward+ for any `energy_multiplier` value.
+- **HDR sky radiance / reflection probes** — radiance cubemaps are stored as
+  `RGBA16F` (when supported) and sampled as linear; `IBL_exposure_normalization`
+  is applied like Forward+.
+- **Linear glow** — glow is computed and blended in linear HDR with real `>1.0`
+  thresholds (no `luminance_multiplier` hack).
+- **Exact sRGB curves** — `tonemap_inc.glsl` uses the exact piecewise sRGB
+  transfer functions instead of approximations.
+
+Known remaining work: the `ENV_BG_CANVAS` background copy path and the temporary
+`print_line` diagnostics (kept intentionally while this is an experimental
+branch).
+
 ## WebGL extensions used (compatibility / device support)
 
 These are the extra WebGL2 extensions this change relies on for the HDR path.
@@ -20,8 +54,10 @@ All three are enabled in `platform/web/display_server_web.cpp` and detected in
 
 Make Godot's Compatibility renderer (the one used by the WebGL2 export) shade in
 **linear HDR** and tonemap **once at the end**, the way the Vulkan/Forward+
-renderer and Unity's WebGL pipeline do. This fixes the washed-out/desaturated
-colors and clipped highlights the old pipeline produced.
+renderer and Unity's WebGL pipeline do. Forward+ output is the reference:
+any change here is judged by how closely it reproduces Forward+ lighting.
+This fixes the washed-out/desaturated colors and clipped highlights the old
+pipeline produced.
 
 ## How it worked before
 
@@ -55,6 +91,9 @@ sample texture -> srgb_to_linear -> light (linear)
 ```
 
 - The scene and sky shaders output **raw linear** color (no exposure/tonemap/sRGB).
+  Sky-material colors are converted sRGB→linear when uploaded to the shader
+  (`source_color` uniforms in `material_storage.cpp`), so the sky shader needs no
+  runtime conversion.
 - The 3D scene always renders through an **intermediate buffer** that is
   `GL_RGBA16F` when the device supports it, otherwise `RGB10_A2`/`RGBA8` (the
   *same* linear pipeline, only the buffer precision differs).
@@ -96,9 +135,10 @@ silently falls back to LDR (clipped -> overexposed/desaturated). Fixed in
 
 - `drivers/gles3/storage/config.{h,cpp}` — capability flags
 - `drivers/gles3/storage/render_scene_buffers_gles3.{h,cpp}` — HDR intermediate buffer (`RGBA16F` + `GL_HALF_FLOAT`), force internal buffer, remove dead plumbing
-- `drivers/gles3/rasterizer_scene_gles3.{h,cpp}` — remove inline tonemap flag/0.25 hack/clear-color linearization
-- `drivers/gles3/shaders/scene.glsl` — output linear only; IBL/reflection/ambient sampled linear (no `srgb_to_linear` on radiance/probe maps)
-- `drivers/gles3/shaders/sky.glsl` — output linear only
+- `drivers/gles3/rasterizer_scene_gles3.{h,cpp}` — remove inline tonemap flag/0.25 hack/clear-color linearization; fog sky shader `clear_color : source_color`
+- `drivers/gles3/storage/material_storage.{h,cpp}` — sky-material `source_color` uniforms converted sRGB→linear at upload (matches Forward+)
+- `drivers/gles3/shaders/scene.glsl` — output linear only; IBL/reflection/ambient sampled linear (no `srgb_to_linear` on radiance/probe maps); `IBL_exposure_normalization` applied to radiance/ambient
+- `drivers/gles3/shaders/sky.glsl` — output linear only (no `srgb_to_linear`, colors are already linear at upload)
 - `drivers/gles3/shaders/effects/post.glsl` — single exposure+tonemap+sRGB pass
 - `drivers/gles3/shaders/effects/glow.glsl` — linear HDR glow (drop luminance_multiplier)
 - `drivers/gles3/shaders/effects/cubemap_filter.glsl` — radiance/probe filtering in linear space (helpers retained, unused)
@@ -128,14 +168,25 @@ preserved. All changes are internal to `drivers/gles3/`:
    buffer without converting.
 2. **Temporary diagnostics:** the one-shot `print_line` logs added for debugging
    (`config.cpp`, `render_scene_buffers_gles3.cpp`, `rasterizer_scene_gles3.cpp`)
-   should be removed once work is done.
+   are kept on purpose while this is an experimental branch; remove them before
+   upstreaming.
 
 ## Verification
 
-Working correctly on **Linux desktop GL** and **WebGL2 (Chrome)**. The earlier
-"web overexposed vs Linux" report was a stale-build comparison: the Linux player
-was stock (`bfae01d184`) while the web build had the HDR changes (`05102de5fb`).
-With both built from the same commit the output matches.
+Every change is validated by comparing **against Forward+ (native Vulkan
+player/editor) as ground truth**, on multiple test scenes (sky-only ambient,
+sky + glow, sky + SSAO, with and without `ProceduralSkyMaterial.energy_multiplier`)
+with a **Linear** tonemapper. The Compatibility renderer now matches Forward+
+output on:
+
+- **Linux desktop GL** and **WebGL2 (Chrome)**.
+- Sky background colors, sky ambient/reflection IBL on materials, and the
+  `energy_multiplier` behavior (sky material colors are linear before the energy
+  multiply, exactly like Forward+).
+
+An earlier "web overexposed vs Linux" report was a stale-build comparison: the
+Linux player was stock (`bfae01d184`) while the web build had the HDR changes
+(`05102de5fb`). With both built from the same commit the output matches.
 
 ## Usage note
 
