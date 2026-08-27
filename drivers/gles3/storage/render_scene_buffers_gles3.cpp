@@ -639,11 +639,120 @@ void RenderSceneBuffersGLES3::_clear_glow_buffers() {
 	}
 }
 
+void RenderSceneBuffersGLES3::check_ssao_buffers() {
+	if (ssao.color != 0) {
+		// already have these setup..
+		return;
+	}
+
+	GLES3::TextureStorage *texture_storage = GLES3::TextureStorage::get_singleton();
+
+	bool use_multiview = view_count > 1;
+	GLenum texture_target = use_multiview ? GL_TEXTURE_2D_ARRAY : GL_TEXTURE_2D;
+
+	ssao.size = Size2i(internal_size.x >> 1, internal_size.y >> 1).maxi(4);
+
+	// Create our texture (RG8, only the occlusion value is stored).
+	glGenTextures(1, &ssao.color);
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(texture_target, ssao.color);
+
+	if (use_multiview) {
+		glTexImage3D(texture_target, 0, GL_RG8, ssao.size.x, ssao.size.y, view_count, 0, GL_RG, GL_UNSIGNED_BYTE, nullptr);
+	} else {
+		glTexImage2D(texture_target, 0, GL_RG8, ssao.size.x, ssao.size.y, 0, GL_RG, GL_UNSIGNED_BYTE, nullptr);
+	}
+
+	glTexParameteri(texture_target, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(texture_target, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(texture_target, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(texture_target, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+	GLES3::Utilities::get_singleton()->texture_allocated_data(ssao.color, ssao.size.x * ssao.size.y * view_count * 2, "SSAO buffer");
+
+	// Create the blur ping-pong buffers.
+	for (int i = 0; i < 2; i++) {
+		glGenTextures(1, &ssao.blur[i]);
+		glBindTexture(texture_target, ssao.blur[i]);
+
+		if (use_multiview) {
+			glTexImage3D(texture_target, 0, GL_RG8, ssao.size.x, ssao.size.y, view_count, 0, GL_RG, GL_UNSIGNED_BYTE, nullptr);
+		} else {
+			glTexImage2D(texture_target, 0, GL_RG8, ssao.size.x, ssao.size.y, 0, GL_RG, GL_UNSIGNED_BYTE, nullptr);
+		}
+
+		glTexParameteri(texture_target, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+		glTexParameteri(texture_target, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+		glTexParameteri(texture_target, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+		glTexParameteri(texture_target, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+		GLES3::Utilities::get_singleton()->texture_allocated_data(ssao.blur[i], ssao.size.x * ssao.size.y * view_count * 2, "SSAO blur buffer");
+
+		glGenFramebuffers(1, &ssao.blur_fbo[i]);
+		glBindFramebuffer(GL_FRAMEBUFFER, ssao.blur_fbo[i]);
+
+		if (use_multiview) {
+			glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, ssao.blur[i], 0, 0);
+		} else {
+			glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, texture_target, ssao.blur[i], 0);
+		}
+
+		GLenum blur_status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+		if (blur_status != GL_FRAMEBUFFER_COMPLETE) {
+			WARN_PRINT("Could not create SSAO blur buffers, status: " + texture_storage->get_framebuffer_error(blur_status));
+		}
+	}
+
+	// Create our FBO
+	glGenFramebuffers(1, &ssao.fbo);
+	glBindFramebuffer(GL_FRAMEBUFFER, ssao.fbo);
+
+	if (use_multiview) {
+		glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, ssao.color, 0, 0);
+	} else {
+		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, texture_target, ssao.color, 0);
+	}
+
+	GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+	if (status != GL_FRAMEBUFFER_COMPLETE) {
+		WARN_PRINT("Could not create SSAO buffers, status: " + texture_storage->get_framebuffer_error(status));
+		_clear_ssao_buffers();
+	}
+
+	glBindTexture(texture_target, 0);
+	glBindFramebuffer(GL_FRAMEBUFFER, GLES3::TextureStorage::system_fbo);
+}
+
+void RenderSceneBuffersGLES3::_clear_ssao_buffers() {
+	if (ssao.fbo != 0) {
+		glDeleteFramebuffers(1, &ssao.fbo);
+		ssao.fbo = 0;
+	}
+
+	for (int i = 0; i < 2; i++) {
+		if (ssao.blur_fbo[i] != 0) {
+			glDeleteFramebuffers(1, &ssao.blur_fbo[i]);
+			ssao.blur_fbo[i] = 0;
+		}
+
+		if (ssao.blur[i] != 0) {
+			GLES3::Utilities::get_singleton()->texture_free_data(ssao.blur[i]);
+			ssao.blur[i] = 0;
+		}
+	}
+
+	if (ssao.color != 0) {
+		GLES3::Utilities::get_singleton()->texture_free_data(ssao.color);
+		ssao.color = 0;
+	}
+}
+
 void RenderSceneBuffersGLES3::free_render_buffer_data() {
 	_clear_msaa3d_buffers();
 	_clear_intermediate_buffers();
 	_clear_back_buffers();
 	_clear_glow_buffers();
+	_clear_ssao_buffers();
 }
 
 GLuint RenderSceneBuffersGLES3::get_render_fbo() {

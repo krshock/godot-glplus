@@ -90,7 +90,6 @@ void PostEffects::_draw_screen_triangle() {
 
 void PostEffects::post_copy(
 		GLuint p_dest_framebuffer, Size2i p_dest_size, GLuint p_source_color,
-		GLuint p_source_depth, bool p_ssao_enabled, int p_ssao_quality_level, float p_ssao_strength, float p_ssao_radius,
 		Size2i p_source_size, const Glow::Level *p_glow_buffers, float p_glow_intensity,
 		float p_srgb_white, uint32_t p_view, bool p_use_multiview, uint64_t p_spec_constants, bool p_bilinear_filtering) {
 	glDisable(GL_DEPTH_TEST);
@@ -108,19 +107,6 @@ void PostEffects::post_copy(
 	if (p_glow_buffers != nullptr) {
 		flags |= PostShaderGLES3::USE_GLOW;
 	}
-	if (p_ssao_enabled) {
-		if (p_ssao_quality_level == RSE::ENV_SSAO_QUALITY_VERY_LOW) {
-			flags |= PostShaderGLES3::USE_SSAO_ABYSS;
-		} else if (p_ssao_quality_level == RSE::ENV_SSAO_QUALITY_LOW) {
-			flags |= PostShaderGLES3::USE_SSAO_LOW;
-		} else if (p_ssao_quality_level == RSE::ENV_SSAO_QUALITY_HIGH) {
-			flags |= PostShaderGLES3::USE_SSAO_HIGH;
-		} else if (p_ssao_quality_level == RSE::ENV_SSAO_QUALITY_ULTRA) {
-			flags |= PostShaderGLES3::USE_SSAO_MEGA;
-		} else {
-			flags |= PostShaderGLES3::USE_SSAO_MED;
-		}
-	}
 
 	bool success = post.shader.version_bind_shader(post.shader_version, mode, flags);
 	if (!success) {
@@ -133,20 +119,6 @@ void PostEffects::post_copy(
 
 	glTexParameteri(texture_target, GL_TEXTURE_MAG_FILTER, p_bilinear_filtering ? GL_LINEAR : GL_NEAREST);
 	glTexParameteri(texture_target, GL_TEXTURE_MIN_FILTER, p_bilinear_filtering ? GL_LINEAR : GL_NEAREST);
-
-	if (p_ssao_enabled) {
-		glActiveTexture(GL_TEXTURE3);
-		glBindTexture(texture_target, p_source_depth);
-		glTexParameteri(texture_target, GL_TEXTURE_MAG_FILTER, GL_NEAREST); // Thanks to mrjustaguy!
-		glTexParameteri(texture_target, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-
-		post.shader.version_set_uniform(PostShaderGLES3::SSAO_INTENSITY, p_ssao_strength, post.shader_version, mode, flags);
-		post.shader.version_set_uniform(PostShaderGLES3::SSAO_RADIUS_FRAC, p_ssao_radius, post.shader_version, mode, flags);
-		post.shader.version_set_uniform(PostShaderGLES3::SSAO_PRN_UV, // This converts the UV coordinate into a pseudo-random number.
-				p_source_size.x * 1.087f * ((1.0f + sqrt(5.0f)) / 2.0f),
-				p_source_size.y * 1.087f * ((9.0f + sqrt(221.0f)) / 10.0f),
-				post.shader_version, mode, flags);
-	}
 
 	if (p_glow_buffers != nullptr) {
 		glActiveTexture(GL_TEXTURE1);
@@ -165,10 +137,6 @@ void PostEffects::post_copy(
 	if (p_glow_buffers != nullptr) {
 		glActiveTexture(GL_TEXTURE1);
 		glBindTexture(GL_TEXTURE_2D, 0);
-	}
-	if (p_ssao_enabled) {
-		glActiveTexture(GL_TEXTURE3);
-		glBindTexture(texture_target, 0);
 	}
 
 	// Return back to nearest

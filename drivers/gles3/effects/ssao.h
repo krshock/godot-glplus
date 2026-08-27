@@ -1,5 +1,5 @@
 /**************************************************************************/
-/*  post_effects.h                                                        */
+/*  ssao.h                                                                */
 /**************************************************************************/
 /*                         This file is part of:                          */
 /*                             GODOT ENGINE                               */
@@ -32,19 +32,24 @@
 
 #ifdef GLES3_ENABLED
 
-#include "drivers/gles3/effects/glow.h"
-#include "drivers/gles3/shaders/effects/post.glsl.gen.h"
+#include "drivers/gles3/shaders/effects/ssao.glsl.gen.h"
+#include "drivers/gles3/shaders/effects/ssao_blur.glsl.gen.h"
 
 namespace GLES3 {
 
-class PostEffects {
+class SSao {
 private:
-	struct Post {
-		PostShaderGLES3 shader;
-		RID shader_version;
-	} post;
+	static SSao *singleton;
 
-	static PostEffects *singleton;
+	struct SSaoShader {
+		SsaoShaderGLES3 shader;
+		RID shader_version;
+	} ssao;
+
+	struct BlurShader {
+		SsaoBlurShaderGLES3 shader;
+		RID shader_version;
+	} blur_shader;
 
 	// Use for full-screen effects. Slightly more efficient than screen_quad as this eliminates pixel overdraw along the diagonal.
 	GLuint screen_triangle = 0;
@@ -53,14 +58,18 @@ private:
 	void _draw_screen_triangle();
 
 public:
-	static PostEffects *get_singleton();
+	static SSao *get_singleton();
 
-	PostEffects();
-	~PostEffects();
+	SSao();
+	~SSao();
 
-	void post_copy(GLuint p_dest_framebuffer, Size2i p_dest_size, GLuint p_source_color,
-			Size2i p_source_size, const Glow::Level *p_glow_buffers, float p_glow_intensity,
-			float p_srgb_white, uint32_t p_view = 0, bool p_use_multiview = false, uint64_t p_spec_constants = 0, bool p_bilinear_filtering = true);
+	// Generates the ambient occlusion buffer from a depth buffer. The occlusion
+	// is written to p_dest_framebuffer (an RG8 half-resolution target).
+	void generate_ssao(GLuint p_source_depth, GLuint p_dest_framebuffer, Size2i p_size, int p_quality_level, float p_strength, float p_radius, Size2i p_source_size, float p_view_mul_x, float p_view_mul_y, float p_view_near, float p_world_radius, float p_flip_y, float p_power, float p_detail, float p_horizon, uint32_t p_view = 0, bool p_use_multiview = false);
+
+	// Blurs the occlusion buffer (edge-aware cross blur, matching Forward+ which
+	// always blurs its AO buffer before use). p_sharpness is the env ssao_sharpness.
+	void blur(GLuint p_source, GLuint p_dest_framebuffer, Size2i p_size, float p_sharpness, uint32_t p_view = 0, bool p_use_multiview = false);
 };
 
 } //namespace GLES3

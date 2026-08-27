@@ -39,6 +39,7 @@ RENDER_MATERIAL = false
 SECOND_REFLECTION_PROBE = false
 LIGHTMAP_BICUBIC_FILTER = false
 RENDER_MOTION_VECTORS = false
+USE_SSAO = false
 
 
 #[vertex]
@@ -228,6 +229,11 @@ struct SceneData {
 	float luminance_multiplier;
 	uint camera_visible_layers;
 	bool pancake_shadows;
+
+	bool use_ssao;
+	float ssao_light_affect;
+	float ssao_ao_channel_affect;
+	float ssao_padding;
 };
 
 // The containing data block is for historic reasons.
@@ -1114,6 +1120,14 @@ uniform samplerCube radiance_map; // texunit:-2
 
 #endif // USE_RADIANCE_MAP
 
+#ifdef USE_SSAO
+#ifdef USE_MULTIVIEW
+uniform sampler2DArray ssao_buffer; // texunit:-12
+#else
+uniform sampler2D ssao_buffer; // texunit:-12
+#endif // USE_MULTIVIEW
+#endif // USE_SSAO
+
 #ifndef DISABLE_REFLECTION_PROBE
 
 #define REFLECTION_PROBE_MAX_LOD 8.0
@@ -1213,6 +1227,11 @@ struct SceneData {
 	float luminance_multiplier;
 	uint camera_visible_layers;
 	bool pancake_shadows;
+
+	bool use_ssao;
+	float ssao_light_affect;
+	float ssao_ao_channel_affect;
+	float ssao_padding;
 };
 
 layout(std140) uniform SceneDataBlock { // ubo:2
@@ -2225,7 +2244,10 @@ void main() {
 #endif
 
 	float ao = 1.0;
-	float ao_light_affect = 0.0;
+	// Screen-space ambient occlusion only affects direct light if requested,
+	// matching the Forward+ renderer. ssao_light_affect controls the direct
+	// light intensity and ssao_ao_channel_affect gates it.
+	float ao_light_affect = mix(0.0, max(0.0, scene_data_block.data.ssao_light_affect), scene_data_block.data.ssao_ao_channel_affect);
 
 	float alpha = 1.0;
 
@@ -2557,6 +2579,14 @@ void main() {
 #endif // USE_LIGHTMAP
 #endif // USE_LIGHTMAP_CAPTURE
 #endif // !DISABLE_LIGHTMAP
+
+#ifdef USE_SSAO
+	// Screen-space ambient occlusion, computed in a half-resolution pass after
+	// the depth prepass. Like the Forward+ renderer, SSAO only occludes the
+	// ambient (indirect) light; the sky and direct lights are unaffected.
+	float ssao = texture(ssao_buffer, multiview_uv(screen_uv)).r;
+	ao = min(ao, ssao);
+#endif
 
 	ambient_light *= ao;
 #ifndef SPECULAR_OCCLUSION_DISABLED

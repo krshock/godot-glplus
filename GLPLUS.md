@@ -1,5 +1,10 @@
 # WEBGLPLUS — Linear HDR shading in the Compatibility (GLES3 / WebGL2) renderer
 
+> **Note:** this project was developed with the assistance of an LLM
+> (DeepSeek V4 Pro). All changes have been reviewed and tested by the project
+> author, but an LLM's involvement should be kept in mind when reading or
+> modifying this code.
+
 ## Summary
 
 This project makes the OpenGL (Compatibility / GLES3 / WebGL2) renderer shade
@@ -27,6 +32,12 @@ Current capabilities (verified against Forward+ on native and WebGL2 on Chrome):
   is applied like Forward+.
 - **Linear glow** — glow is computed and blended in linear HDR with real `>1.0`
   thresholds (no `luminance_multiplier` hack).
+- **Forward+-style SSAO** — an ASSAO-style gather runs in its own half-resolution
+  pass after the depth prepass, with view-space obscurance (normals reconstructed
+  from depth), a packed depth-edge channel and an edge-aware blur. The AO is
+  applied to **ambient light only** in the scene shader (direct lights and the
+  sky are not darkened), and `ssao_light_affect`, `ssao_ao_channel_affect`,
+  `ssao_power` and `ssao_sharpness` work like Forward+.
 - **Exact sRGB curves** — `tonemap_inc.glsl` uses the exact piecewise sRGB
   transfer functions instead of approximations.
 
@@ -102,6 +113,53 @@ sample texture -> srgb_to_linear -> light (linear)
 - Glow is computed and blended in **linear HDR** space (real `>1.0` thresholds).
 - `tonemap_inc.glsl` now uses the **exact** piecewise sRGB transfer functions.
 
+## SSAO pipeline
+
+The stock Compatibility SSAO (a depth-only S4AO computed inside the post pass)
+was replaced by a Forward+-style pipeline:
+
+```
+depth prepass (forced when SSAO is on)
+  -> half-res RG8 gather:  R = occlusion, G = packed depth edges
+  -> edge-aware cross blur (ASS AO MODE_SMART port)
+  -> scene shader: ao = min(material_ao, ssao); ambient *= ao
+     (direct light only when ssao_light_affect > 0; sky never darkened)
+```
+
+Gather details (matching Forward+ semantics):
+
+- View position and normal are reconstructed from the depth buffer (integer
+  texel neighborhood, phase-consistent on any canvas size).
+- Obscurance = `max(NdotD - ssao_horizon, 0)` weighted by a quadratic world
+  falloff, per-tap weights from the ASS AO pattern and halo reduction.
+- Tap counts: VERY_LOW 3, LOW 5, MED/HIGH/ULTRA 12 (mirrored ×2); the adaptive
+  quality level is not ported.
+- ASS AO detail term (4 neighbor obscurances, edge-weighted) for crevices.
+- Shaping: `occlusion = pow(1 - min(intensity * avg, 0.98), ssao_power)`.
+- The radius uses Forward+'s world-unit semantics (converted to screen space
+  per pixel); the sampling disk uses the 85% lookup-radius factor.
+- `ssao_detail` and `ssao_horizon` are honored but stay hidden in the GL
+  inspector; `ssao_power` and `ssao_sharpness` are visible.
+
+### SSAO performance cost vs the original GL SSAO
+
+| (MED quality, 1080p) | **Original GL SSAO** (post-pass S4AO) | **New SSAO** |
+|---|---|---|
+| Where AO runs | Inside the post pass, applied to the whole framebuffer | Own half-res passes **before** shading, applied in the scene shader to **ambient only** |
+| Extra fullscreen passes | 0 (inside post) | **+2** (gather + edge-aware blur, both half-res) |
+| Depth taps per AO pixel | 12 — at **full resolution** | 24 + ~16 normal/edge/detail fetches — at **half resolution** (¼ pixels) |
+| Total depth fetches per frame | ≈ 12 × full-res pixels | ≈ 10 × full-res pixels |
+| Geometry draw calls | +0 | +0 with the default depth prepass; **+1 depth-only draw per opaque object** if a project disabled it |
+| RAM | 0 extra | **~3 MB** at 1080p (3 half-res RG8 buffers + 3 FBOs; ~1.8 MB/buffer at 1440p, ~4.2 MB/buffer at 4K → ~12.5 MB total) |
+| MSAA 3D | none | +1 depth resolve blit before the gather |
+| What it darkens | whole image (direct, reflections, sky) | ambient only (Forward+ semantics) |
+| Output quality | raw, binary-ish contact halos | edge-aware blurred, graded falloff |
+
+Takeaways: the sampling math is roughly the same or slightly cheaper in fetch
+bandwidth (half-res); the cost is 2 extra half-res passes, a forced depth
+prepass and ~3 MB of buffers. Scene draw calls only grow in prepass-disabled
+projects. The structure is the same cost class as Forward+.
+
 ## Capability detection (auto HDR + fallback)
 
 In `drivers/gles3/storage/config.cpp`:
@@ -134,12 +192,19 @@ silently falls back to LDR (clipped -> overexposed/desaturated). Fixed in
 ## Files changed
 
 - `drivers/gles3/storage/config.{h,cpp}` — capability flags
-- `drivers/gles3/storage/render_scene_buffers_gles3.{h,cpp}` — HDR intermediate buffer (`RGBA16F` + `GL_HALF_FLOAT`), force internal buffer, remove dead plumbing
-- `drivers/gles3/rasterizer_scene_gles3.{h,cpp}` — remove inline tonemap flag/0.25 hack/clear-color linearization; fog sky shader `clear_color : source_color`
+- `drivers/gles3/storage/render_scene_buffers_gles3.{h,cpp}` — HDR intermediate buffer (`RGBA16F` + `GL_HALF_FLOAT`), force internal buffer, remove dead plumbing; half-res RG8 SSAO gather buffer + blur ping-pong buffers
+- `drivers/gles3/rasterizer_scene_gles3.{h,cpp}` — remove inline tonemap flag/0.25 hack/clear-color linearization; fog sky shader `clear_color : source_color`; SSAO pass after the depth prepass (prepass forced when SSAO is on, MSAA depth resolved first); `use_ssao`/`ssao_light_affect`/`ssao_ao_channel_affect` scene UBO fields; world-unit radius conversion and the `SS_AO_STRENGTH_CALIBRATION` factor
 - `drivers/gles3/storage/material_storage.{h,cpp}` — sky-material `source_color` uniforms converted sRGB→linear at upload (matches Forward+)
-- `drivers/gles3/shaders/scene.glsl` — output linear only; IBL/reflection/ambient sampled linear (no `srgb_to_linear` on radiance/probe maps); `IBL_exposure_normalization` applied to radiance/ambient
+- `drivers/gles3/shaders/scene.glsl` — output linear only; IBL/reflection/ambient sampled linear (no `srgb_to_linear` on radiance/probe maps); `IBL_exposure_normalization` applied to radiance/ambient; SSAO sampled from a half-res buffer and applied to ambient only (`ao = min(ao, ssao)`, direct light per `ssao_light_affect`)
 - `drivers/gles3/shaders/sky.glsl` — output linear only (no `srgb_to_linear`, colors are already linear at upload)
-- `drivers/gles3/shaders/effects/post.glsl` — single exposure+tonemap+sRGB pass
+- `drivers/gles3/shaders/effects/post.glsl` — single exposure+tonemap+sRGB pass (SSAO removed from post)
+- `drivers/gles3/shaders/effects/ssao.glsl` — new SSAO gather pass (Forward+-style view-space obscurance, ASSAO tap pattern, detail term, packed depth edges)
+- `drivers/gles3/shaders/effects/ssao_blur.glsl` — new edge-aware cross blur for the AO buffer (ASS AO MODE_SMART port)
+- `drivers/gles3/shaders/s4ao_disk_inc.glsl` — new shared tap-gather include (replaces the deleted `s4ao_micro_inc.glsl` / `s4ao_inc.glsl` / `s4ao_mega_inc.glsl`)
+- `drivers/gles3/effects/ssao.{h,cpp}` — new SSAO effect (gather + blur, screen-triangle passes)
+- `drivers/gles3/effects/post_effects.{h,cpp}` — drop SSAO plumbing
+- `drivers/gles3/shaders/effects/SCsub` — include dependencies also cover `../*_inc.glsl` (edits to the s4ao includes now regenerate the shader headers)
+- `scene/resources/environment.cpp` — editor-only: `ssao_light_affect`/`ssao_ao_channel_affect`/`ssao_power`/`ssao_sharpness` visible in Compatibility (no API change)
 - `drivers/gles3/shaders/effects/glow.glsl` — linear HDR glow (drop luminance_multiplier)
 - `drivers/gles3/shaders/effects/cubemap_filter.glsl` — radiance/probe filtering in linear space (helpers retained, unused)
 - `drivers/gles3/shaders/effects/copy.glsl` — radiance panorama bake reads linear
@@ -166,10 +231,42 @@ preserved. All changes are internal to `drivers/gles3/`:
 1. **`ENV_BG_CANVAS`:** the canvas-as-background copy (`copy_screen`/
    `copy_with_exposure`) writes sRGB canvas data into the now-linear internal
    buffer without converting.
-2. **Temporary diagnostics:** the one-shot `print_line` logs added for debugging
+2. **SSAO dark-end parity:** the depth-mip chain of the Forward+ gather is not
+   ported, so GL still accumulates slightly more occlusion and its darkest
+   areas clamp earlier than Forward+'s. A static strength calibration factor
+   compensates for this: `SS_AO_STRENGTH_CALIBRATION = 0.5f` in
+   `rasterizer_scene_gles3.cpp` (tune against Forward+ color picks). A future
+   step can port the depth mips (and the normal buffer, since GL reconstructs
+   normals from depth) to remove the factor.
+3. **SSAO quality levels:** the adaptive (ULTRA) gather is not ported (ULTRA
+   uses the 12-tap preset); `ssao_detail` and `ssao_horizon` are honored but
+   hidden in the GL inspector.
+4. **Temporary diagnostics:** the one-shot `print_line` logs added for debugging
    (`config.cpp`, `render_scene_buffers_gles3.cpp`, `rasterizer_scene_gles3.cpp`)
    are kept on purpose while this is an experimental branch; remove them before
    upstreaming.
+
+## GLES3 shader gotchas (WebGL2 / ANGLE)
+
+Desktop GL drivers (NVIDIA etc.) are lenient about everything below, but ANGLE
+(WebGL2) enforces them. Every GLES3 shader change must be verified on WebGL2:
+
+- **No global-scope `const` arrays** — ANGLE rejects brace initializers and
+  WebGL2 restricts dynamic indexing of const arrays. Use a plain function with
+  an `if`/`else if` chain per entry instead.
+- **No nested `#include`** — the shader preprocessor only inlines an included
+  file the first time; later references are dropped silently. Keep includes
+  single-level.
+- **No textual `#define` reliance** — `#define`s are consumed but not
+  substituted into the source. Use `const int` values and `#if defined(...)`
+  conditionals instead.
+- **Functions must be defined before use** (GLSL ES rule; NVIDIA tolerates
+  forward references, ANGLE does not).
+- **No trailing comments on `uniform` lines** — the uniform parser scans the
+  rest of the line and turns comment words into bogus uniform names.
+- **Depth textures are `GL_NEAREST`-only** — setting `GL_LINEAR` filters on a
+  depth texture makes WebGL2 read zeros (incomplete texture), killing the AO
+  entirely.
 
 ## Verification
 
@@ -183,6 +280,9 @@ output on:
 - Sky background colors, sky ambient/reflection IBL on materials, and the
   `energy_multiplier` behavior (sky material colors are linear before the energy
   multiply, exactly like Forward+).
+- SSAO: the AO shape and falloff match Forward+ (cavities darken, flat surfaces
+  and the sky stay clean), with the strength calibrated through
+  `SS_AO_STRENGTH_CALIBRATION` (see Known follow-ups).
 
 An earlier "web overexposed vs Linux" report was a stale-build comparison: the
 Linux player was stock (`bfae01d184`) while the web build had the HDR changes

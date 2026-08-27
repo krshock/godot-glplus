@@ -85,12 +85,22 @@ public:
 		GLES3::Glow::Level levels[4];
 	} glow;
 
+	// Half-resolution SSAO buffers (RG8): gather output plus a blur ping-pong pair.
+	struct SSAO {
+		Size2i size;
+		GLuint color = 0;
+		GLuint fbo = 0;
+		GLuint blur[2] = { 0, 0 };
+		GLuint blur_fbo[2] = { 0, 0 };
+	} ssao;
+
 private:
 	void _check_render_buffers();
 	void _clear_msaa3d_buffers();
 	void _clear_intermediate_buffers();
 	void _clear_back_buffers();
 	void _clear_glow_buffers();
+	void _clear_ssao_buffers();
 
 	void _rt_attach_textures(GLuint p_color, GLuint p_depth, GLsizei p_samples, uint32_t p_view_count, bool p_depth_has_stencil);
 	GLuint _rt_get_cached_fbo(GLuint p_color, GLuint p_depth, GLsizei p_samples, uint32_t p_view_count);
@@ -110,6 +120,7 @@ public:
 
 	void check_backbuffer(bool p_need_color, bool p_need_depth); // Check if we need to initialize our backbuffer.
 	void check_glow_buffers(); // Check if we need to initialize our glow buffers.
+	void check_ssao_buffers(); // Check if we need to initialize our SSAO buffers.
 
 	GLuint get_render_fbo();
 	GLuint get_msaa3d_fbo() {
@@ -145,6 +156,29 @@ public:
 	GLuint get_backbuffer_depth() const { return backbuffer3d.depth; }
 
 	const GLES3::Glow::Level *get_glow_buffers() const { return &glow.levels[0]; }
+
+	GLuint get_ssao_fbo() {
+		_check_render_buffers();
+		return ssao.fbo;
+	}
+	// The scene shader consumes the blurred AO buffer.
+	GLuint get_ssao_buffer() {
+		_check_render_buffers();
+		return ssao.blur[1];
+	}
+	// The raw gather output target.
+	GLuint get_ssao_gather_buffer() {
+		_check_render_buffers();
+		return ssao.color;
+	}
+	GLuint get_ssao_blur_buffer(int p_index) {
+		_check_render_buffers();
+		return ssao.blur[p_index];
+	}
+	GLuint get_ssao_blur_fbo(int p_index) {
+		_check_render_buffers();
+		return ssao.blur_fbo[p_index];
+	}
 
 	// Getters
 

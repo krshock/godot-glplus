@@ -37,6 +37,7 @@
 #include "drivers/gles3/effects/feed_effects.h"
 #include "drivers/gles3/effects/glow.h"
 #include "drivers/gles3/effects/post_effects.h"
+#include "drivers/gles3/effects/ssao.h"
 #include "drivers/gles3/environment/fog.h"
 #include "drivers/gles3/environment/gi.h"
 #include "drivers/gles3/rasterizer_canvas_gles3.h"
@@ -75,6 +76,7 @@ protected:
 	GLES3::CubemapFilter *cubemap_filter = nullptr;
 	GLES3::Glow *glow = nullptr;
 	GLES3::PostEffects *post_effects = nullptr;
+	GLES3::SSao *ssao = nullptr;
 	GLES3::FeedEffects *feed_effects = nullptr;
 	RasterizerCanvasGLES3 *canvas = nullptr;
 	RasterizerSceneGLES3 *scene = nullptr;

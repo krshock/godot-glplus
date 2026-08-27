@@ -1185,9 +1185,11 @@ void Environment::_validate_property(PropertyInfo &p_property) const {
 	}
 
 	if (OS::get_singleton()->get_current_rendering_method() != "forward_plus") {
-		// Hide SSAO properties that only work in Forward+.
+		// Hide SSAO properties that only work in Forward+. The Compatibility
+		// renderer also supports the direct light and AO channel affects, the
+		// power curve, and the blur sharpness.
 		if (p_property.name.begins_with("ssao_")) {
-			if ((p_property.name != "ssao_enabled") && (p_property.name != "ssao_radius") && (p_property.name != "ssao_intensity")) {
+			if ((p_property.name != "ssao_enabled") && (p_property.name != "ssao_radius") && (p_property.name != "ssao_intensity") && (p_property.name != "ssao_light_affect") && (p_property.name != "ssao_ao_channel_affect") && (p_property.name != "ssao_power") && (p_property.name != "ssao_sharpness")) {
 				p_property.usage = PROPERTY_USAGE_NO_EDITOR;
 			}
 			return;

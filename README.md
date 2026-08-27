@@ -1,5 +1,8 @@
 # Godot Engine
 
+> **Experimental fork of Godot 4.7.2-stable.** Please read
+> [GLPLUS.md](GLPLUS.md) for the new GLES3/WebGL features.
+
 <p align="center">
   <a href="https://godotengine.org">
     <img src="misc/logo/logo_outlined.svg" width="400" alt="Godot Engine logo">

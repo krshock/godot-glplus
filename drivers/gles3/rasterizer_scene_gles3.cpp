@@ -1592,6 +1592,10 @@ void RasterizerSceneGLES3::_setup_environment(const RenderDataGLES3 *p_render_da
 	scene_state.data.shadow_bias = p_shadow_bias;
 	scene_state.data.pancake_shadows = p_pancake_shadows;
 
+	scene_state.data.use_ssao = 0;
+	scene_state.data.ssao_light_affect = 0.0;
+	scene_state.data.ssao_ao_channel_affect = 0.0;
+
 	//time global variables
 	scene_state.data.time = time;
 
@@ -1612,6 +1616,15 @@ void RasterizerSceneGLES3::_setup_environment(const RenderDataGLES3 *p_render_da
 		scene_state.data.ambient_light_color_energy[3] = bg_energy_multiplier;
 
 		scene_state.data.ambient_color_sky_mix = environment_get_ambient_sky_contribution(p_render_data->environment);
+
+		// Screen-space ambient occlusion is only applied to ambient light, like the
+		// Forward+ renderer. Reflection probe renders are screen-independent, so
+		// SSAO does not apply to them.
+		if (!p_render_data->reflection_probe.is_valid()) {
+			scene_state.data.use_ssao = environment_get_ssao_enabled(p_render_data->environment);
+			scene_state.data.ssao_light_affect = environment_get_ssao_direct_light_affect(p_render_data->environment);
+			scene_state.data.ssao_ao_channel_affect = environment_get_ssao_ao_channel_affect(p_render_data->environment);
+		}
 
 		//ambient
 		if (ambient_src == RSE::ENV_AMBIENT_SOURCE_BG && (env_bg == RSE::ENV_BG_CLEAR_COLOR || env_bg == RSE::ENV_BG_COLOR)) {
@@ -1649,9 +1662,10 @@ void RasterizerSceneGLES3::_setup_environment(const RenderDataGLES3 *p_render_da
 		static bool logged_amb = false;
 		if (!logged_amb) {
 			logged_amb = true;
-			print_line(vformat("AMBIENT SETUP: ambient_src=%d env_bg=%d sky_mix=%f bg_energy=%f use_ambient_light=%d use_ambient_cubemap=%d use_reflection_cubemap=%d ambient_color_energy=(%f,%f,%f,%f)",
+			print_line(vformat("AMBIENT SETUP: ambient_src=%d env_bg=%d sky_mix=%f bg_energy=%f use_ambient_light=%d use_ambient_cubemap=%d use_reflection_cubemap=%d use_ssao=%d ssao_light_affect=%f ssao_ao_affect=%f ambient_color_energy=(%f,%f,%f,%f)",
 					(int)ambient_src, (int)env_bg, scene_state.data.ambient_color_sky_mix, bg_energy_multiplier,
 					(int)scene_state.data.use_ambient_light, (int)scene_state.data.use_ambient_cubemap, (int)scene_state.data.use_reflection_cubemap,
+					(int)scene_state.data.use_ssao, scene_state.data.ssao_light_affect, scene_state.data.ssao_ao_channel_affect,
 					scene_state.data.ambient_light_color_energy[0], scene_state.data.ambient_light_color_energy[1], scene_state.data.ambient_light_color_energy[2], scene_state.data.ambient_light_color_energy[3]));
 		}
 
@@ -2428,8 +2442,35 @@ void RasterizerSceneGLES3::render_scene(const Ref<RenderSceneBuffers> &p_render_
 	}
 
 	bool ssao_enabled = false;
-	if (p_environment.is_valid()) {
+	float ssao_strength = 2.0;
+	float ssao_radius = 0.5;
+	float ssao_power = 1.5;
+	float ssao_detail = 0.5;
+	float ssao_horizon = 0.06;
+	float ssao_sharpness = 0.98;
+	if (p_environment.is_valid() && !is_reflection_probe) {
 		ssao_enabled = environment_get_ssao_enabled(p_environment);
+		// Static calibration factor for matching Forward+'s AO strength until
+		// the depth-mip chain is ported. Tune against Forward+ color picks.
+		static const float SS_AO_STRENGTH_CALIBRATION = 0.55f;
+		ssao_strength = environment_get_ssao_intensity(p_environment) * SS_AO_STRENGTH_CALIBRATION;
+		ssao_power = environment_get_ssao_power(p_environment);
+		ssao_detail = environment_get_ssao_detail(p_environment);
+		ssao_horizon = environment_get_ssao_horizon(p_environment);
+		ssao_sharpness = environment_get_ssao_sharpness(p_environment);
+		// Convert the radius from world units (like Forward+) into the depth-scaled
+		// UV fraction used by S4AO. The scene depth buffer uses reverse-Z, where
+		// depth ~= z_near / view_distance, so an offset of R world units at view
+		// distance z covers (R / (2 * tan(fov_y / 2) * z_near)) * depth in UV space.
+		// For orthographic cameras, R world units map to a constant UV offset.
+		const float env_radius = environment_get_ssao_radius(p_environment);
+		if (p_camera_data->is_orthogonal) {
+			const float ortho_half_size = 1.0f / MAX(p_camera_data->main_projection.columns[0][0], 1e-6f);
+			ssao_radius = env_radius / (2.0f * ortho_half_size);
+		} else {
+			const float tan_half_fov = 1.0f / MAX(p_camera_data->main_projection.columns[1][1], 1e-6f);
+			ssao_radius = env_radius / (2.0f * tan_half_fov * MAX(p_camera_data->main_projection.get_z_near(), 1e-6f));
+		}
 	}
 
 	// Assign render data
@@ -2719,6 +2760,9 @@ void RasterizerSceneGLES3::render_scene(const Ref<RenderSceneBuffers> &p_render_
 	// Forcibly enable depth prepass if opaque stencil writes are used.
 	use_depth_prepass = use_depth_prepass || scene_state.used_opaque_stencil;
 
+	// SSAO needs the depth buffer before the color pass, so it requires a depth prepass.
+	use_depth_prepass = use_depth_prepass || ssao_enabled;
+
 	// Don't do depth prepass we are rendering overdraw
 	use_depth_prepass = use_depth_prepass && get_debug_draw_mode() != RSE::VIEWPORT_DEBUG_DRAW_OVERDRAW;
 
@@ -2758,6 +2802,102 @@ void RasterizerSceneGLES3::render_scene(const Ref<RenderSceneBuffers> &p_render_
 		scene_state.used_depth_prepass = true;
 	} else {
 		scene_state.used_depth_prepass = false;
+	}
+
+	if (ssao_enabled) {
+		// Generate the ambient occlusion buffer from the depth prepass. SSAO is
+		// computed at half resolution and applied to ambient light only in the
+		// scene shader, matching the Forward+ renderer.
+		RENDER_TIMESTAMP("SSAO Pass");
+		GLES3::SSao *ssao = GLES3::SSao::get_singleton();
+		GLuint ssao_depth = rb->get_internal_depth();
+
+		// View-space reconstruction parameters for the Forward+-style obscurance.
+		const float ssao_view_mul_x = 1.0f / MAX(p_camera_data->main_projection.columns[0][0], 1e-6f);
+		const float ssao_view_mul_y = 1.0f / MAX(p_camera_data->main_projection.columns[1][1], 1e-6f);
+		const float ssao_view_near = MAX(p_camera_data->main_projection.get_z_near(), 1e-6f);
+		const float ssao_world_radius = environment_get_ssao_radius(p_environment);
+		const float ssao_flip_y = flip_y ? -1.0f : 1.0f;
+
+		static bool logged_ssao_run = false;
+		if (!logged_ssao_run) {
+			logged_ssao_run = true;
+			print_line(vformat("SSAO RUN: view=%d msaa_fbo=%d internal_fbo=%d depth_tex=%d internal_size=%dx%d quality=%d strength=%f radius=%f world_radius=%f view_mul=(%f,%f) near=%f flip_y=%f power=%f detail=%f horizon=%f sharpness=%f",
+					p_camera_data->view_count, rb->get_msaa3d_fbo(), rb->get_internal_fbo(), ssao_depth,
+					rb->internal_size.x, rb->internal_size.y, (int)ssao_quality, ssao_strength, ssao_radius, ssao_world_radius, ssao_view_mul_x, ssao_view_mul_y, ssao_view_near, ssao_flip_y, ssao_power, ssao_detail, ssao_horizon, ssao_sharpness));
+		}
+
+		if (p_camera_data->view_count == 1) {
+			if (rb->get_msaa3d_fbo() != 0) {
+				// Resolve the MSAA depth into our internal buffer for the AO pass.
+				glBindFramebuffer(GL_READ_FRAMEBUFFER, rb->get_msaa3d_fbo());
+				glBindFramebuffer(GL_DRAW_FRAMEBUFFER, rb->get_internal_fbo());
+				glBlitFramebuffer(0, 0, rb->internal_size.x, rb->internal_size.y, 0, 0, rb->internal_size.x, rb->internal_size.y, GL_DEPTH_BUFFER_BIT, GL_NEAREST);
+			}
+
+			static bool logged_ssao_depth = false;
+			if (!logged_ssao_depth) {
+				logged_ssao_depth = true;
+#ifndef WEB_ENABLED
+				// WebGL2 does not support reading GL_DEPTH_COMPONENT via
+				// glReadPixels at all, so this diagnostic is desktop-only.
+				// The SSAO OUT readback works everywhere.
+				// Use a scratch depth-only FBO (some drivers reject depth reads
+				// from framebuffers that also have a color attachment).
+				GLuint scratch_fbo = 0;
+				glGenFramebuffers(1, &scratch_fbo);
+				glBindFramebuffer(GL_READ_FRAMEBUFFER, scratch_fbo);
+				glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, ssao_depth, 0);
+				uint32_t depth_samples[4] = { 0, 0, 0, 0 };
+				glReadPixels(rb->internal_size.x / 2, rb->internal_size.y / 2, 1, 1, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, &depth_samples[0]);
+				glReadPixels(rb->internal_size.x / 4, rb->internal_size.y / 2, 1, 1, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, &depth_samples[1]);
+				glReadPixels(rb->internal_size.x * 3 / 4, rb->internal_size.y / 2, 1, 1, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, &depth_samples[2]);
+				glReadPixels(rb->internal_size.x / 2, rb->internal_size.y / 4, 1, 1, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, &depth_samples[3]);
+				glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+				glDeleteFramebuffers(1, &scratch_fbo);
+				print_line(vformat("SSAO DEPTH: center=%f q25=%f q75=%f lower=%f", double(depth_samples[0]) / 4294967295.0, double(depth_samples[1]) / 4294967295.0, double(depth_samples[2]) / 4294967295.0, double(depth_samples[3]) / 4294967295.0));
+#else
+				print_line("SSAO DEPTH: not available on WebGL2 (readPixels does not support GL_DEPTH_COMPONENT)");
+#endif
+			}
+
+			rb->check_ssao_buffers();
+			ssao->generate_ssao(ssao_depth, rb->get_ssao_fbo(), rb->ssao.size, ssao_quality, ssao_strength, ssao_radius, rb->internal_size, ssao_view_mul_x, ssao_view_mul_y, ssao_view_near, ssao_world_radius, ssao_flip_y, ssao_power, ssao_detail, ssao_horizon);
+
+			// Blur the AO buffer (edge-aware, like Forward+) so the occlusion
+			// falls off smoothly while dark creases stay dark.
+			ssao->blur(rb->ssao.color, rb->get_ssao_blur_fbo(1), rb->ssao.size, ssao_sharpness);
+		} else {
+			rb->check_ssao_buffers();
+
+			GLuint fbos[2];
+			glGenFramebuffers(2, fbos);
+
+			for (uint32_t v = 0; v < p_camera_data->view_count; v++) {
+				if (rb->get_msaa3d_fbo() != 0) {
+					glBindFramebuffer(GL_READ_FRAMEBUFFER, fbos[0]);
+					glFramebufferTextureLayer(GL_READ_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, rb->get_msaa3d_depth(), 0, v);
+					glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbos[1]);
+					glFramebufferTextureLayer(GL_DRAW_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, ssao_depth, 0, v);
+					glBlitFramebuffer(0, 0, rb->internal_size.x, rb->internal_size.y, 0, 0, rb->internal_size.x, rb->internal_size.y, GL_DEPTH_BUFFER_BIT, GL_NEAREST);
+				}
+
+				glBindFramebuffer(GL_FRAMEBUFFER, rb->get_ssao_fbo());
+				glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, rb->get_ssao_gather_buffer(), 0, v);
+				ssao->generate_ssao(ssao_depth, rb->get_ssao_fbo(), rb->ssao.size, ssao_quality, ssao_strength, ssao_radius, rb->internal_size, ssao_view_mul_x, ssao_view_mul_y, ssao_view_near, ssao_world_radius, ssao_flip_y, ssao_power, ssao_detail, ssao_horizon, v, true);
+
+				// Blur the AO buffer (edge-aware, like Forward+).
+				glBindFramebuffer(GL_FRAMEBUFFER, rb->get_ssao_blur_fbo(1));
+				glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, rb->get_ssao_blur_buffer(1), 0, v);
+				ssao->blur(rb->ssao.color, rb->get_ssao_blur_fbo(1), rb->ssao.size, ssao_sharpness, v, true);
+			}
+
+			glDeleteFramebuffers(2, fbos);
+		}
+
+		// Restore the scene framebuffer and viewport.
+		glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+		glViewport(0, 0, rb->internal_size.x, rb->internal_size.y);
 	}
 
 	glBlendEquation(GL_FUNC_ADD);
@@ -2836,6 +2976,10 @@ void RasterizerSceneGLES3::render_scene(const Ref<RenderSceneBuffers> &p_render_
 
 		if (render_data.environment.is_valid() && environment_get_fog_mode(render_data.environment) == RSE::EnvironmentFogMode::ENV_FOG_MODE_DEPTH) {
 			spec_constant_base_flags |= SceneShaderGLES3::USE_DEPTH_FOG;
+		}
+
+		if (ssao_enabled) {
+			spec_constant_base_flags |= SceneShaderGLES3::USE_SSAO;
 		}
 	}
 
@@ -2989,17 +3133,9 @@ void RasterizerSceneGLES3::_render_post_processing(const RenderDataGLES3 *p_rend
 		rb->check_glow_buffers();
 	}
 
-	// Check if we want and can have SSAO.
-	bool ssao_enabled = false;
-	float ssao_strength = 4.0;
-	float ssao_radius = 0.5;
-	if (p_render_data->environment.is_valid()) {
-		ssao_enabled = environment_get_ssao_enabled(p_render_data->environment);
-		// This SSAO is not implemented the same way, but uses the intensity and radius
-		// in a similar way.  The parameters are scaled so the SSAO defaults look ok.
-		ssao_strength = environment_get_ssao_intensity(p_render_data->environment) * 2.0;
-		ssao_radius = environment_get_ssao_radius(p_render_data->environment) * 0.5;
-	}
+	// Check if we want and can have SSAO. SSAO is generated before the color
+	// pass and applied to ambient light in the scene shader, so nothing to do
+	// in post processing.
 
 	uint64_t bcs_spec_constants = 0;
 	if (p_render_data->environment.is_valid()) {
@@ -3049,9 +3185,6 @@ void RasterizerSceneGLES3::_render_post_processing(const RenderDataGLES3 *p_rend
 			// Apply glow/bloom if requested? then populate our glow buffers
 			GLuint color = fbo_int != 0 ? rb->get_internal_color() : texture_storage->render_target_get_color(render_target);
 
-			// We need to pass this in for SSAO.
-			GLuint depth_buffer = fbo_int != 0 ? rb->get_internal_depth() : texture_storage->render_target_get_depth(render_target);
-
 			const GLES3::Glow::Level *glow_buffers = nullptr;
 			if (glow_enabled) {
 				glow_buffers = rb->get_glow_buffers();
@@ -3067,7 +3200,6 @@ void RasterizerSceneGLES3::_render_post_processing(const RenderDataGLES3 *p_rend
 
 			// Copy color buffer
 			post_effects->post_copy(fbo_rt, target_size, color,
-					depth_buffer, ssao_enabled, ssao_quality, ssao_strength, ssao_radius,
 					internal_size, glow_buffers, glow_intensity,
 					srgb_white, 0, false, bcs_spec_constants, p_render_data->render_buffers->scaling_3d_mode != RSE::VIEWPORT_SCALING_3D_MODE_NEAREST);
 
@@ -3116,7 +3248,6 @@ void RasterizerSceneGLES3::_render_post_processing(const RenderDataGLES3 *p_rend
 			const GLES3::Glow::Level *glow_buffers = nullptr;
 			GLuint source_color = fbo_int != 0 ? rb->get_internal_color() : texture_storage->render_target_get_color(render_target);
 
-			// Moved this up so SSAO could use it too.
 			GLuint read_depth = rb->get_internal_depth();
 
 			if (glow_enabled) {
@@ -3139,7 +3270,6 @@ void RasterizerSceneGLES3::_render_post_processing(const RenderDataGLES3 *p_rend
 				glBindFramebuffer(GL_FRAMEBUFFER, fbos[2]);
 				glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, write_color, 0, v);
 				post_effects->post_copy(fbos[2], target_size, source_color,
-						read_depth, ssao_enabled, ssao_quality, ssao_strength, ssao_radius,
 						internal_size, glow_buffers, glow_intensity,
 						srgb_white, v, true, bcs_spec_constants, p_render_data->render_buffers->scaling_3d_mode != RSE::VIEWPORT_SCALING_3D_MODE_NEAREST);
 			}
@@ -3197,6 +3327,21 @@ void RasterizerSceneGLES3::_render_list_template(RenderListParameters *p_params,
 				base_spec_constants |= SceneShaderGLES3::USE_RADIANCE_MAP;
 			}
 			glBindTexture(GL_TEXTURE_CUBE_MAP, texture_to_bind);
+		}
+
+		// Screen-space ambient occlusion buffer.
+		if (scene_state.data.use_ssao) {
+			Ref<RenderSceneBuffersGLES3> rb = p_render_data->render_buffers;
+			GLuint ssao_texture = rb->get_ssao_buffer();
+			static bool logged_ssao_bind = false;
+			if (!logged_ssao_bind) {
+				logged_ssao_bind = true;
+				print_line(vformat("SSAO BIND: use_ssao=%d ssao_tex=%d unit=%d", (int)scene_state.data.use_ssao, ssao_texture, config->max_texture_image_units - 12));
+			}
+			if (ssao_texture != 0) {
+				glActiveTexture(GL_TEXTURE0 + config->max_texture_image_units - 12);
+				glBindTexture(p_render_data->view_count > 1 ? GL_TEXTURE_2D_ARRAY : GL_TEXTURE_2D, ssao_texture);
+			}
 		}
 
 		// Area Light Lookup Tables
