@@ -1,23 +1,34 @@
-# WEBGLPLUS — Linear HDR shading in the Compatibility (GLES3 / WebGL2) renderer
+# GLPLUS — (Reasonably) match 3D output between the gl_compatibility and Forward+ renderers
 
-> **Note:** this project was developed with the assistance of an LLM
-> (DeepSeek V4 Pro). All changes have been reviewed and tested by the project
-> author, but an LLM's involvement should be kept in mind when reading or
-> modifying this code.
+> **LLM assistance disclosure:** this project was developed with the assistance
+> of an LLM (DeepSeek V4 Pro). All changes have been reviewed and tested by the
+> fork creator.
 
-## Summary
+## Project description
 
-This project makes the OpenGL (Compatibility / GLES3 / WebGL2) renderer shade
-the way the **Forward+ (Vulkan) renderer does, with Forward+ as the ground
-truth**: the goal is to **minimize lighting differences between the two
-renderers**, so the same scene looks the same on GL and Vulkan.
+- A Godot 4.7.2-stable fork
+- It aims **to close the visual gap of 3D rendering output** between
+  gl_compatibility and Forward+ (including tonemapping)
+- Tested targets: web export, native player and editor (Linux)
+- **Full binary compatibility:** you can edit your 3D project in the stock
+  4.7.2-stable editor and it will look the same, e.g. when using the web export
+  for testing/debugging
+- It uses GL extensions supported by ~98% of browsers
+  (source: https://web3dsurvey.com/webgl)
+- Compatibility SSAO reasonably matches Forward+ SSAO and honors most of the
+  full SSAO properties
+- No new GL features or node support: it only matches the shading features
+  shared between GL and Forward+
+- **Experimental:** more shading feature tests are needed to verify correctness
 
-This change turns Godot's Compatibility renderer into a **linear HDR pipeline
-that matches Forward+**, while keeping full binary/API compatibility with
-Godot's scripting and extension API.
+## Why?
 
-Current capabilities (verified against Forward+ on native and WebGL2 on Chrome):
+The Compatibility (gl_compatibility) renderer uses low dynamic range (LDR)
+buffers and non-linear math for shading, making both renderers look very
+different depending on which shading features are used in the materials and
+environment setup — making some features worse, such as tonemapping.
 
+## What was modified?
 - **HDR intermediate buffer** — the 3D scene renders to `GL_RGBA16F` (or
   `RGB10_A2`/`RGBA8` fallback) instead of an 8-bit sRGB buffer; values above 1.0
   survive until tonemapping.
@@ -41,10 +52,6 @@ Current capabilities (verified against Forward+ on native and WebGL2 on Chrome):
 - **Exact sRGB curves** — `tonemap_inc.glsl` uses the exact piecewise sRGB
   transfer functions instead of approximations.
 
-Known remaining work: the `ENV_BG_CANVAS` background copy path and the temporary
-`print_line` diagnostics (kept intentionally while this is an experimental
-branch).
-
 ## WebGL extensions used (compatibility / device support)
 
 These are the extra WebGL2 extensions this change relies on for the HDR path.
@@ -60,15 +67,6 @@ On devices that lack them, the renderer automatically falls back to an LDR
 All three are enabled in `platform/web/display_server_web.cpp` and detected in
 `drivers/gles3/storage/config.cpp`; `hdr_render_supported` requires
 `(color_buffer_float OR color_buffer_half_float) AND float_blend`.
-
-## Goal
-
-Make Godot's Compatibility renderer (the one used by the WebGL2 export) shade in
-**linear HDR** and tonemap **once at the end**, the way the Vulkan/Forward+
-renderer and Unity's WebGL pipeline do. Forward+ output is the reference:
-any change here is judged by how closely it reproduces Forward+ lighting.
-This fixes the washed-out/desaturated colors and clipped highlights the old
-pipeline produced.
 
 ## How it worked before
 
@@ -102,16 +100,11 @@ sample texture -> srgb_to_linear -> light (linear)
 ```
 
 - The scene and sky shaders output **raw linear** color (no exposure/tonemap/sRGB).
-  Sky-material colors are converted sRGB→linear when uploaded to the shader
-  (`source_color` uniforms in `material_storage.cpp`), so the sky shader needs no
-  runtime conversion.
 - The 3D scene always renders through an **intermediate buffer** that is
   `GL_RGBA16F` when the device supports it, otherwise `RGB10_A2`/`RGBA8` (the
   *same* linear pipeline, only the buffer precision differs).
 - `post.glsl` is the **single** place that applies exposure, tonemapping, and
   linear->sRGB conversion.
-- Glow is computed and blended in **linear HDR** space (real `>1.0` thresholds).
-- `tonemap_inc.glsl` now uses the **exact** piecewise sRGB transfer functions.
 
 ## SSAO pipeline
 
