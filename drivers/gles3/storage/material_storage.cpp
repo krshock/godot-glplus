@@ -3159,6 +3159,13 @@ void SceneShaderData::set_code(const String &p_code) {
 	uses_vertex_time = gen_code.uses_vertex_time;
 	uses_fragment_time = gen_code.uses_fragment_time;
 
+	if (uses_screen_texture) {
+		// Screen-texture materials write ALBEDO/EMISSION in linear space
+		// (Forward+ semantics), so the scene shader must not convert them
+		// from sRGB to linear.
+		gen_code.defines.push_back("#define MATERIAL_ALBEDO_LINEAR\n");
+	}
+
 	stencil_enabled = stencil_referencei != -1;
 	stencil_flags = stencil_readi | stencil_writei | stencil_write_depth_faili;
 	stencil_compare = StencilCompare(stencil_comparei);
@@ -3262,7 +3269,10 @@ void SceneMaterialData::set_next_pass(RID p_pass) {
 }
 
 void SceneMaterialData::update_parameters(const HashMap<StringName, Variant> &p_parameters, bool p_uniform_dirty, bool p_textures_dirty) {
-	update_parameters_internal(p_parameters, p_uniform_dirty, p_textures_dirty, shader_data->uniforms, shader_data->ubo_offsets.ptr(), shader_data->texture_uniforms, shader_data->default_texture_params, shader_data->ubo_size, true, false);
+	// Screen-texture materials write ALBEDO/EMISSION in linear space (see
+	// MATERIAL_ALBEDO_LINEAR in scene.glsl), so their source_color uniforms
+	// must be uploaded as linear too, matching Forward+.
+	update_parameters_internal(p_parameters, p_uniform_dirty, p_textures_dirty, shader_data->uniforms, shader_data->ubo_offsets.ptr(), shader_data->texture_uniforms, shader_data->default_texture_params, shader_data->ubo_size, true, shader_data->uses_screen_texture);
 }
 
 SceneMaterialData::~SceneMaterialData() {

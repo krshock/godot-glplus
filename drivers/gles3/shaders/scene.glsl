@@ -2415,9 +2415,13 @@ void main() {
 	uint fog_ba = packHalf2x16(fog.ba);
 #endif // !FOG_DISABLED
 
-	// Convert colors to linear
+	// Convert colors to linear.
+	// Materials that read the screen texture write ALBEDO/EMISSION in linear
+	// space (Forward+ semantics), so skip the conversion for them.
+#ifndef MATERIAL_ALBEDO_LINEAR
 	albedo = srgb_to_linear(albedo);
 	emission = srgb_to_linear(emission);
+#endif // !MATERIAL_ALBEDO_LINEAR
 	// TODO Backlight and transmittance when used
 #ifndef MODE_UNSHADED
 	vec3 f0 = F0(metallic, specular, albedo);
