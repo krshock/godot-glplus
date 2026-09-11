@@ -892,7 +892,9 @@ bool LightStorage::reflection_probe_instance_begin_render(RID p_instance, RID p_
 		// values above 1.0 like the Forward+ renderer. Fall back to RGB10_A2.
 		const bool use_hdr = Config::get_singleton()->hdr_render_supported;
 		const GLenum reflection_format = use_hdr ? GL_RGBA16F : GL_RGB10_A2;
+#ifdef GL_API_ENABLED
 		const GLenum reflection_type = use_hdr ? GL_HALF_FLOAT : GL_UNSIGNED_INT_2_10_10_10_REV;
+#endif
 		const uint32_t bytes_per_pixel = use_hdr ? 8 : 4;
 
 		glActiveTexture(GL_TEXTURE0);

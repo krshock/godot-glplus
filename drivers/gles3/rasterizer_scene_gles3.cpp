@@ -605,7 +605,9 @@ GLuint _init_radiance_texture(int p_size, int p_mipmaps, String p_name) {
 	// stay saturated like the Forward+ renderer. Otherwise fall back to RGB10_A2.
 	const bool use_hdr = GLES3::Config::get_singleton()->hdr_render_supported;
 	GLenum internal_format = use_hdr ? GL_RGBA16F : GL_RGB10_A2;
+#ifdef GL_API_ENABLED
 	GLenum pixel_type = use_hdr ? GL_HALF_FLOAT : GL_UNSIGNED_INT_2_10_10_10_REV;
+#endif
 	Image::Format size_format = use_hdr ? Image::FORMAT_RGBAH : Image::FORMAT_RGBA8;
 
 	glGenTextures(1, &radiance_id);
